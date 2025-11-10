@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use crate::Priv;
+
 #[derive(Debug)]
 pub struct Memory {
     regions: Vec<Region>,
@@ -10,7 +12,7 @@ pub struct Memory {
 pub struct Region {
     range: Range<u64>,
     mem  : Vec<u8>,
-    perm : MemoryAuthority,
+    perm : Priv,
 }
 
 
@@ -18,8 +20,8 @@ impl Memory {
     pub fn new() -> Self {
         Self {
             regions: vec![
-                Region::new(0x8000_0000..0xA000_0000, MemoryAuthority::Admin), // rom
-                Region::new(0xA000_0000..0xF000_0000, MemoryAuthority::User ), // ram
+                Region::new(0x8000_0000..0xA000_0000, Priv::Machine), // rom
+                Region::new(0xA000_0000..0xF000_0000, Priv::User ), // ram
             ],
         }
     }
@@ -41,7 +43,7 @@ impl Memory {
     }
 
 
-    pub fn write<'me>(&mut self, perm: MemoryAuthority, ptr: Ptr, data: &[u8]) {
+    pub fn write<'me>(&mut self, perm: Priv, ptr: Ptr, data: &[u8]) {
         for region in &mut self.regions {
             if region.range.contains(&ptr.0) {
                 region.write(perm, ptr, data);
@@ -55,7 +57,7 @@ impl Memory {
 
 
 impl Region {
-    pub fn new(range: Range<u64>, perm: MemoryAuthority) -> Self {
+    pub fn new(range: Range<u64>, perm: Priv) -> Self {
         Self {
             range,
             mem: vec![],
@@ -82,7 +84,7 @@ impl Region {
     }
 
 
-    pub fn write(&mut self, perm: MemoryAuthority, ptr: Ptr, data: &[u8]) {
+    pub fn write(&mut self, perm: Priv, ptr: Ptr, data: &[u8]) {
         if (perm as u64) < (self.perm as u64) {
             panic!("permission error");
         }

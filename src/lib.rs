@@ -3,7 +3,7 @@ pub mod utils;
 
 use std::{ops::{Index, IndexMut}, thread::sleep_ms};
 
-use crate::{mem::{Memory, Ptr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}};
+use crate::{mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
 pub struct Emulator {
     mem: Memory,
@@ -57,82 +57,65 @@ impl Emulator {
         let mideleg = self.csr[CSR_MIDELEG];
 
         let interrupt = (cause >> 63) != 0;
-        let code = cause & 0x7FFF_FFFF_FFFF_FFFF;
+        let code = cause & (u64::MAX >> 1);
 
-        let delegated = if interrupt {
+        let delegated_to_s = if interrupt {
             ((mideleg >> code) & 1) != 0
         } else {
             ((medeleg >> code) & 1) != 0
         };
 
-        if delegated {
-            // Supervisor trap
-            let mut sstatus = self.csr[CSR_SSTATUS];
-            let sie = (sstatus >> 1) & 1;
-            sstatus = (sstatus & !(1 << 5)) | (sie << 5); // SPIE = SIE
-            sstatus &= !(1 << 1);                         // SIE = 0
-            let spp = (self.mode as u64) & 1;             // previous privilege (U=0, S=1)
-            sstatus = (sstatus & !(1 << 8)) | (spp << 8); // SPP = prev mode
-            self.csr[CSR_SSTATUS] = sstatus;
-
-            self.csr[CSR_SEPC] = self.pc;
-            self.csr[CSR_SCAUSE] = cause;
-            self.csr[CSR_STVAL] = tval;
-
-            self.mode = Priv::Supervisor;
-
-            let stvec = self.csr[CSR_STVEC];
-            let base = stvec & !0b11;
-            let mode = stvec & 0b11;
-            if mode == 1 && interrupt {
-                self.pc = base + 4 * code;
-            } else {
-                self.pc = base;
-            }
+        if delegated_to_s {
+            self._trap(
+                CSR_SSTATUS, CSR_SEPC, CSR_SCAUSE, CSR_STVAL, CSR_STVEC,
+                1, 5, 8, 1, Priv::Supervisor, cause, tval
+            );
             return;
         }
 
-        // Machine trap
-        let mut mstatus = self.csr[CSR_MSTATUS];
-        const MSTATUS_MPP_MASK: u64 = 0b11 << 11;
+        self._trap(
+            CSR_MSTATUS, CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MTVEC,
+            3, 7, 11, 2, Priv::Machine, cause, tval);
+    }
 
-        let mie = (mstatus >> 3) & 1;
-        mstatus = (mstatus & !(1 << 7)) | (mie << 7); // MPIE = MIE
-        mstatus &= !(1 << 3);                         // MIE = 0
-        mstatus = (mstatus & !MSTATUS_MPP_MASK) | ((self.mode as u64) << 11);
-        self.csr[CSR_MSTATUS] = mstatus;
 
-        self.csr[CSR_MEPC] = self.pc;
-        self.csr[CSR_MCAUSE] = cause;
-        self.csr[CSR_MTVAL] = tval;
 
-        self.mode = Priv::Machine;
+    fn _trap(
+        &mut self, status_csr: usize, epc_csr: usize, cause_csr: usize,
+        tval_csr: usize, tvec_csr: usize, ie_bit: u32, pie_bit: u32,
+        pp_bit: u32, pp_len: u32, new_mode: Priv, cause: u64, tval: u64
+    ) {
+        let interrupt = (cause >> 63) != 0;
+        let code = cause & (u64::MAX >> 1);
 
-        let mtvec = self.csr[CSR_MTVEC];
-        let base = mtvec & !0b11;
-        let mode = mtvec & 0b11;
-        if mode == 1 && interrupt {
+
+        let mut status = self.csr[status_csr];
+        let ie = ubfx_64(status, ie_bit, 1);
+
+        // xPIE = xIE
+        status = bfi_64(status, pie_bit, 1, ie);
+        // xIE = 0
+        status = bfi_64(status, ie_bit, 1, 0);
+        // xPP = previous mode
+        status = bfi_64(status, pp_bit, pp_len, self.mode as u64);
+
+        self.csr[status_csr] = status;
+        self.csr[epc_csr] = self.pc;
+        self.csr[cause_csr] = cause;
+        self.csr[tval_csr] = tval;
+
+        // Enter new privilege mode
+        self.mode = new_mode;
+
+        // Set PC from trap vector
+        let tvec = self.csr[tvec_csr];
+        let base = tvec & !0b11;
+        let tmode = tvec & 0b11;
+        if tmode == 1 && interrupt {
             self.pc = base + 4 * code;
         } else {
             self.pc = base;
         }
-    }
-
-
-    pub fn mret(&mut self) {
-        let mstatus = self.csr[CSR_MSTATUS];
-        let mpp = (mstatus >> 11) & 0b11;
-
-        self.mode = match mpp {
-            0 => Priv::User,
-            1 => Priv::Supervisor,
-            2 => Priv::Machine,
-
-            _ => panic!("INVALID MPP")
-        };
-
-        self.csr[CSR_MSTATUS] &= !(0b11 << 11);
-        self.pc = self.csr[CSR_MEPC];
     }
 
 
@@ -370,7 +353,7 @@ impl Emulator {
                     let funct12 = ubfx_32(instr, 20, 12);
                     match funct12 {
                         // ecall
-                        0x000 => {
+                        0b00000_00_00000 => {
                             let cause = match self.mode {
                                 Priv::User        => 8,
                                 Priv::Supervisor  => 9,
@@ -382,15 +365,82 @@ impl Emulator {
                         }
 
                         // ebreak
-                        0x001 => {
-                            self.trap(3, 0);
+                        0b00000_00_00001 => {
+                            self.trap(3, self.pc);
                             continue;
                         }
+
+                        0b00000_00_00010 => {
+                            unimplemented!("uret is not supposed");
+                        }
+                        
+                        0b00010_00_00010 => {
+                            self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
+                        }
+
+
+                        // mret
+                        0b00110_00_00010 => {
+                            self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
+                        }
+                        
 
                         _ => panic!("unknown system instruction"),
                     }
                 }
 
+
+
+                0b0000011 => {
+                    let funct3 = ubfx_32(instr, 12, 3);
+                    let rd = ubfx_32(instr, 7, 5);
+                    let rs1 = ubfx_32(instr, 15, 5) as usize;
+                    let rs1 = self.x.read(rs1);
+                    let offset = sbfx_32(instr, 20, 12) as i32 as i64;
+
+                    let ptr = (rs1 as i64 + offset) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let result = match funct3 {
+                        0b000 => {
+                            let byte = self.mem.read(ptr, 1)[0];
+
+                            byte as i8 as i64 as u64
+                        }
+
+                        0b001 => {
+                            let byte = self.mem.read(ptr, 2);
+                            let value = i16::from_ne_bytes(byte.try_into().unwrap());
+
+                            value as i64 as u64
+                        }
+
+
+                        0b010 => {
+                            let byte = self.mem.read(ptr, 4);
+                            let value = i32::from_ne_bytes(byte.try_into().unwrap());
+
+                            value as i64 as u64
+                        }
+
+                        0b100 => {
+                            let byte = self.mem.read(ptr, 1)[0];
+
+                            byte as u64
+                        }
+
+                        0b101 => {
+                            let byte = self.mem.read(ptr, 2);
+                            let value = u16::from_ne_bytes(byte.try_into().unwrap());
+
+                            value as u64
+                        }
+
+                        _ => panic!("unkown load")
+                    };
+
+                    self.x.write(rd as usize, result);
+                }
 
 
                 _ => panic!("unkown opcode {opcode:b}"),
@@ -400,6 +450,31 @@ impl Emulator {
             self.csr[CSR_CYCLE] += 1;
             sleep_ms(100);
         }
+    }
+
+
+    fn _ret(&mut self, status: usize, epc: usize, ie_bit: u32, pie_bit: u32, pp_bit: u32, pp_len: u32) {
+        let mut mstatus = self.csr[status];
+        let mpie = ubfx_64(mstatus, pie_bit, 1);
+        let mpp  = ubfx_64(mstatus, pp_bit, pp_len);
+
+        // Restore privilege
+        self.mode = match mpp {
+            0 => Priv::User,
+            1 => Priv::Supervisor,
+            3 => Priv::Machine,
+            _ => Priv::User,
+        };
+
+        // Restore interrupt enable: MIE = MPIE
+        mstatus = bfi_64(mstatus, ie_bit, 1, mpie);
+        // Clear MPIE
+        mstatus = bfi_64(mstatus, pie_bit, 1, 0);
+        // Set MPP = User (0)
+        mstatus = bfi_64(mstatus, pp_bit, pp_len, 0);
+
+        self.csr[status] = mstatus;
+        self.pc = self.csr[epc];
     }
 }
 
