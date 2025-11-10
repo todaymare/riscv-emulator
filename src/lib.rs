@@ -3,7 +3,7 @@ pub mod utils;
 
 use std::{ops::{Index, IndexMut}, thread::sleep_ms};
 
-use crate::{mem::{Memory, MemoryAuthority, Ptr}, utils::{bfi_32, sbfx_32, ubfx_32}};
+use crate::{mem::{Memory, MemoryAuthority, Ptr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}};
 
 pub struct Emulator {
     mem: Memory,
@@ -39,16 +39,34 @@ impl Emulator {
                     let funct = ubfx_32(instr, 12, 3);
                     let dst = ubfx_32(instr,  7,  5) as usize;
                     let src = ubfx_32(instr, 15,  5) as usize;
-                    let imm = sbfx_32(instr, 20, 12);
+                    let src = self.x.read(src);
+                    let imm = sbfx_64(instr as u64, 20, 12);
 
-                    match funct {
+                    let result = match funct {
                         // add
-                        0b000 => {
-                            self.x.write(dst, self.x.read(src) + imm as u64);
-                        }
+                        0b000 => src.wrapping_add(imm),
+
+                        // slti
+                        0b010 => ((src as i64) < (imm as i64)) as u64,
+
+                        // sltiu
+                        0b011 => (src < imm) as u64,
+
+
+                        // xori
+                        0b100 => src ^ imm,
+
+                        // ori
+                        0b110 => src | imm,
+
+                        // andi
+                        0b111 => src & imm,
 
                         _ => panic!("unkown iinstr"),
-                    }
+                    };
+
+                    dbg!(src, imm, dst, result);
+                    self.x.write(dst, result);
                 },
 
 
@@ -60,17 +78,23 @@ impl Emulator {
 
                     let rs1    = ubfx_32(instr, 15, 5) as usize;
                     let rs2    = ubfx_32(instr, 20, 5) as usize;
+                    let rs1    = self.x.read(rs1);
+                    let rs2    = self.x.read(rs2);
                     let dst    = ubfx_32(instr,  7, 5) as usize;
 
 
-                    match funct {
+                    let result = match funct {
                         // add
-                        0b0000000_000 => {
-                            self.x.write(dst, self.x.read(rs1) + self.x.read(rs2));
-                        }
+                        0b0000000_000 => rs1.wrapping_add(rs2),
+
+                        // sub
+                        0b0100000_000 => rs1.wrapping_sub(rs2),
 
                         _ => panic!("unkown rinstr"),
-                    }
+                    };
+
+                    dbg!(rs1, rs2, dst, result as i64);
+                    self.x.write(dst, result);
                 }
 
 
@@ -101,7 +125,7 @@ impl Emulator {
                 }
 
 
-                // lui
+                // auipc
                 0b0010111 => {
                     let rd = ubfx_32(instr, 7, 5) as usize;
                     let imm = ubfx_32(instr, 12, 20);
