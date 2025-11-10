@@ -14,13 +14,6 @@ pub struct Region {
 }
 
 
-#[derive(Debug, Clone, Copy)]
-pub enum MemoryAuthority {
-    User = 0,
-    Admin = 1,
-}
-
-
 impl Memory {
     pub fn new() -> Self {
         Self {
