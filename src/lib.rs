@@ -28,6 +28,8 @@ const CSR_MEPC   : usize = 0x341;
 const CSR_MCAUSE : usize = 0x342;
 const CSR_MTVAL  : usize = 0x343;
 const CSR_MTVEC  : usize = 0x305;
+const CSR_MIE: usize = 0x304;
+const CSR_MIP: usize = 0x344;
 const CSR_MSTATUS: usize = 0x300;
 const CSR_MIDELEG: usize = 0x303;
 const CSR_MEDELEG: usize = 0x302;
@@ -196,22 +198,44 @@ impl Emulator {
                 // register-imm arithm pt2
                 0b0011011 => {
                     let funct3 = ubfx_32(instr, 12, 3);
+                    let funct7 = ubfx_32(instr, 25, 7);
                     let rd  = ubfx_32(instr,  7,  5) as usize;
                     let rs1 = ubfx_32(instr, 15,  5) as usize;
                     let rs1 = self.x.read(rs1 as usize);
                     let imm = sbfx_64(instr as u64, 20, 12);
 
-                    match funct3 {
+                    let result = match funct3 {
                         // addiw
                         0b000 => {
-                            let result = (rs1 as i64 as i32).wrapping_add(imm as i64 as i32);
-                            let result = result as i64 as u64;
-                            self.x.write(rd, result);
+                            rs1.wrapping_add(imm as i64 as u64) as u32
+                        }
+
+                        // slliw
+                        0b001 => {
+                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            (rs1 << shamt) as u32
+                        }
+
+
+                        // srliw
+                        0b101 if funct7 == 0b00000_00 => {
+                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            rs1 as u32 >> shamt
+                        }
+
+
+                        // sraiw
+                        0b101 if funct7 == 0b01000_00 => {
+                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            (rs1 as i32 >> shamt) as u32
                         }
 
 
                         _ => panic!("unknown iinstrpt2")
-                    }
+                    };
+
+
+                    self.x.write(rd, result as i32 as i64 as u64);
 
 
                 }
@@ -271,21 +295,52 @@ impl Emulator {
                 // register-register arithm pt2
                 0b0111011 => {
                     let funct7 = ubfx_32(instr, 25, 7);
+                    let funct3 = ubfx_32(instr, 12, 3);
 
                     let rs1    = ubfx_32(instr, 15, 5) as usize;
                     let rs2    = ubfx_32(instr, 20, 5) as usize;
                     let rs1    = self.x.read(rs1);
                     let rs2    = self.x.read(rs2);
-                    let dst    = ubfx_32(instr,  7, 5) as usize;
+                    let rd     = ubfx_32(instr,  7, 5) as usize;
 
-                    match funct7 {
-                        0b0000000 => {
+                    let result = match funct3 {
+                        // addw
+                        0b000 if funct7 == 0b00000_00 => {
                             let result = (rs1 as u32).wrapping_add(rs2 as u32);
-                            let result = result as i32 as i64 as u64;
-                            self.x.write(dst, result);
+                            result
                         }
+
+                        // subw
+                        0b000 if funct7 == 0b10000_00 => {
+                            let result = (rs1 as u32).wrapping_sub(rs2 as u32);
+                            result
+                        }
+
+
+                        // sllw
+                        0b001 => {
+                            let shamt = rs2 & 0x3F;
+                            (rs1 << shamt) as u32
+                        }
+
+                        // srlw
+                        0b101 if funct7 == 0b00000_00  => {
+                            let shamt = rs2 & 0x3F;
+                            rs1 as u32 >> shamt
+                        }
+
+                        // sraiw
+                        0b101 if funct7 == 0b01000_00 => {
+                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            (rs1 as i32 >> shamt) as u32
+                        }
+
+
                         _ => panic!("unkown rinstrpt2")
-                    }
+                    };
+
+
+                    self.x.write(rd, result as i32 as i64 as u64);
                 }
 
 
@@ -404,6 +459,8 @@ impl Emulator {
                                         for x in 0..32 {
                                             println!("x{x} - {}({:x})", self.x.read(x), self.x.read(x));
                                         }
+
+                                        println!("CYCLE COUNT: {}", self.csr[CSR_CYCLE]);
                                         break;
                                     }
 
@@ -417,10 +474,7 @@ impl Emulator {
                                     continue;
                                 }
 
-                                0b00000_00_00010 => {
-                                    unimplemented!("uret is not supposed");
-                                }
-                                
+                                // sret
                                 0b00010_00_00010 => {
                                     self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
                                 }
@@ -430,7 +484,14 @@ impl Emulator {
                                 0b00110_00_00010 => {
                                     self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
                                 }
-                                
+
+                                // wfi
+                                0b00010_00_00101 => {
+                                    while self.csr[CSR_MIE] & self.csr[CSR_MIP] == 0 {}
+                                }
+
+                                // sfence.vma
+                                _ if ubfx_32(instr, 25, 7) == 0b0001001 => {},
 
                                 _ => panic!("unknown system instruction"),
                             }
@@ -456,12 +517,14 @@ impl Emulator {
                     let ptr = Ptr(ptr);
 
                     let result = match funct3 {
+                        // lb
                         0b000 => {
                             let byte = self.mem.read(ptr, 1)[0];
 
                             byte as i8 as i64 as u64
                         }
 
+                        // lh
                         0b001 => {
                             let byte = self.mem.read(ptr, 2);
                             let value = i16::from_ne_bytes(byte.try_into().unwrap());
@@ -469,7 +532,7 @@ impl Emulator {
                             value as i64 as u64
                         }
 
-
+                        // lw
                         0b010 => {
                             let byte = self.mem.read(ptr, 4);
                             let value = i32::from_ne_bytes(byte.try_into().unwrap());
@@ -477,12 +540,14 @@ impl Emulator {
                             value as i64 as u64
                         }
 
+                        // lbu
                         0b100 => {
                             let byte = self.mem.read(ptr, 1)[0];
 
                             byte as u64
                         }
 
+                        // lhu
                         0b101 => {
                             let byte = self.mem.read(ptr, 2);
                             let value = u16::from_ne_bytes(byte.try_into().unwrap());
@@ -490,6 +555,16 @@ impl Emulator {
                             value as u64
                         }
 
+                        // lwu
+                        0b110 => {
+                            let byte = self.mem.read(ptr, 4);
+                            let value = u32::from_ne_bytes(byte.try_into().unwrap());
+
+                            value as u64
+                        }
+
+
+                        // ld
                         0b011 => {
                             let byte = self.mem.read(ptr, 8);
                             let value = u64::from_ne_bytes(byte.try_into().unwrap());
@@ -519,6 +594,25 @@ impl Emulator {
                     let ptr = Ptr(ptr);
 
                     match funct3 {
+                        // sb
+                        0b000 => {
+                            self.mem.write(self.mode, ptr, &[(self.x.read(rs2) & 0xFF) as u8]);
+                        }
+
+
+                        // sh
+                        0b001 => {
+                            self.mem.write(self.mode, ptr, &((self.x.read(rs2) & 0xFFFF) as u16).to_ne_bytes());
+                        }
+
+
+                        // sw
+                        0b010 => {
+                            self.mem.write(self.mode, ptr, &((self.x.read(rs2) & 0xFFFF_FFFF) as u32).to_ne_bytes());
+                        }
+
+
+                        // sd
                         0b011 => {
                             self.mem.write(self.mode, ptr, &self.x.read(rs2).to_ne_bytes());
                         }
@@ -542,20 +636,64 @@ impl Emulator {
                     let imm = sbfx_64((imm << 1) as u64, 0, 13);
 
 
-                    match funct3 {
+                    let cond = match funct3 {
+                        // beq
+                        0b000 => {
+                            let rs1 = self.x.read(rs1);
+                            let rs2 = self.x.read(rs2);
+
+                            rs1 == rs2
+                        }
+
+                        // bne
+                        0b001 => {
+                            let rs1 = self.x.read(rs1);
+                            let rs2 = self.x.read(rs2);
+
+                            rs1 != rs2
+                        }
+
+                        // blt
                         0b100 => {
                             let rs1 = self.x.read(rs1) as i64;
                             let rs2 = self.x.read(rs2) as i64;
 
-                            if rs1 < rs2 {
-                                self.pc = self.pc.wrapping_add(imm);
-                                continue;
-                            }
+                            rs1 < rs2
                         }
 
-                        _ => panic!("unknown branch")
-                    }
 
+                        // bge
+                        0b101 => {
+                            let rs1 = self.x.read(rs1) as i64;
+                            let rs2 = self.x.read(rs2) as i64;
+
+                            rs1 >= rs2
+                        }
+
+                        // bltu
+                        0b110 => {
+                            let rs1 = self.x.read(rs1);
+                            let rs2 = self.x.read(rs2);
+
+                            rs1 < rs2
+                        }
+
+                        // bgeu
+                        0b111 => {
+                            let rs1 = self.x.read(rs1);
+                            let rs2 = self.x.read(rs2);
+
+                            rs1 >= rs2
+                        }
+
+
+                        _ => panic!("unknown branch")
+                    };
+
+                    if cond {
+                        self.pc = self.pc.wrapping_add(imm);
+                        continue;
+                    }
                 }
 
 

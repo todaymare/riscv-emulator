@@ -3,7 +3,7 @@
 
 _start:
     # Argument: a0 = 30
-    li      a0, 40
+    li      a0, 30
 
     # Call fib(30)
     call    fib
