@@ -21,7 +21,7 @@ impl Memory {
         Self {
             regions: vec![
                 Region::new(0x8000_0000..0xA000_0000, Priv::Machine), // rom
-                Region::new(0xA000_0000..0xF000_0000, Priv::User ), // ram
+                Region::new(0xA000_0000..0xB000_0000, Priv::User ), // ram
             ],
         }
     }

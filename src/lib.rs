@@ -1,7 +1,7 @@
 pub mod mem;
 pub mod utils;
 
-use std::{ops::{Index, IndexMut}, thread::sleep_ms};
+use std::thread::sleep_ms;
 
 use crate::{mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
@@ -120,6 +120,7 @@ impl Emulator {
 
 
     pub fn run(&mut self, code: &[u8]) {
+        self.x.write(2, 0xB000_0000);
         self.pc = 0x8000_0000;
 
         self.mem.write(self.mode, Ptr(self.pc), code);
@@ -188,9 +189,32 @@ impl Emulator {
                         _ => panic!("unkown iinstr"),
                     };
 
-                    dbg!(src, imm, dst, result);
                     self.x.write(dst, result);
                 },
+
+
+                // register-imm arithm pt2
+                0b0011011 => {
+                    let funct3 = ubfx_32(instr, 12, 3);
+                    let rd  = ubfx_32(instr,  7,  5) as usize;
+                    let rs1 = ubfx_32(instr, 15,  5) as usize;
+                    let rs1 = self.x.read(rs1 as usize);
+                    let imm = sbfx_64(instr as u64, 20, 12);
+
+                    match funct3 {
+                        // addiw
+                        0b000 => {
+                            let result = (rs1 as i64 as i32).wrapping_add(imm as i64 as i32);
+                            let result = result as i64 as u64;
+                            self.x.write(rd, result);
+                        }
+
+
+                        _ => panic!("unknown iinstrpt2")
+                    }
+
+
+                }
 
 
                 // register-register arithm
@@ -240,8 +264,28 @@ impl Emulator {
                         _ => panic!("unkown rinstr"),
                     };
 
-                    dbg!(rs1, rs2, dst, result as i64);
                     self.x.write(dst, result);
+                }
+
+
+                // register-register arithm pt2
+                0b0111011 => {
+                    let funct7 = ubfx_32(instr, 25, 7);
+
+                    let rs1    = ubfx_32(instr, 15, 5) as usize;
+                    let rs2    = ubfx_32(instr, 20, 5) as usize;
+                    let rs1    = self.x.read(rs1);
+                    let rs2    = self.x.read(rs2);
+                    let dst    = ubfx_32(instr,  7, 5) as usize;
+
+                    match funct7 {
+                        0b0000000 => {
+                            let result = (rs1 as u32).wrapping_add(rs2 as u32);
+                            let result = result as i32 as i64 as u64;
+                            self.x.write(dst, result);
+                        }
+                        _ => panic!("unkown rinstrpt2")
+                    }
                 }
 
 
@@ -341,6 +385,57 @@ impl Emulator {
                             }
                         }
 
+
+                        0b000 => {
+                            let funct12 = ubfx_32(instr, 20, 12);
+                            match funct12 {
+                                // ecall
+                                0b00000_00_00000 => {
+                                    let cause = match self.mode {
+                                        Priv::User        => 8,
+                                        Priv::Supervisor  => 9,
+                                        Priv::Machine     => 11,
+                                    };
+
+
+                                    let num = self.x.read(17);
+                                    if num == 93 {
+                                        println!("terminating");
+                                        for x in 0..32 {
+                                            println!("x{x} - {}({:x})", self.x.read(x), self.x.read(x));
+                                        }
+                                        break;
+                                    }
+
+                                    self.trap(cause, 0);
+                                    continue;
+                                }
+
+                                // ebreak
+                                0b00000_00_00001 => {
+                                    self.trap(3, self.pc);
+                                    continue;
+                                }
+
+                                0b00000_00_00010 => {
+                                    unimplemented!("uret is not supposed");
+                                }
+                                
+                                0b00010_00_00010 => {
+                                    self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
+                                }
+
+
+                                // mret
+                                0b00110_00_00010 => {
+                                    self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
+                                }
+                                
+
+                                _ => panic!("unknown system instruction"),
+                            }
+                        }
+
                         _ => panic!("invalid csr instruction"),
                     };
 
@@ -349,48 +444,7 @@ impl Emulator {
                 }
 
 
-                0b1110011 => {
-                    let funct12 = ubfx_32(instr, 20, 12);
-                    match funct12 {
-                        // ecall
-                        0b00000_00_00000 => {
-                            let cause = match self.mode {
-                                Priv::User        => 8,
-                                Priv::Supervisor  => 9,
-                                Priv::Machine     => 11,
-                            };
-
-                            self.trap(cause, 0);
-                            continue;
-                        }
-
-                        // ebreak
-                        0b00000_00_00001 => {
-                            self.trap(3, self.pc);
-                            continue;
-                        }
-
-                        0b00000_00_00010 => {
-                            unimplemented!("uret is not supposed");
-                        }
-                        
-                        0b00010_00_00010 => {
-                            self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
-                        }
-
-
-                        // mret
-                        0b00110_00_00010 => {
-                            self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
-                        }
-                        
-
-                        _ => panic!("unknown system instruction"),
-                    }
-                }
-
-
-
+                // loads
                 0b0000011 => {
                     let funct3 = ubfx_32(instr, 12, 3);
                     let rd = ubfx_32(instr, 7, 5);
@@ -436,10 +490,94 @@ impl Emulator {
                             value as u64
                         }
 
+                        0b011 => {
+                            let byte = self.mem.read(ptr, 8);
+                            let value = u64::from_ne_bytes(byte.try_into().unwrap());
+
+                            value
+                        }
+
                         _ => panic!("unkown load")
                     };
 
                     self.x.write(rd as usize, result);
+                }
+
+
+                // stores
+                0b0100011 => {
+                    let funct3 = ubfx_32(instr, 12, 3);
+                    let imm5 = ubfx_32(instr, 7, 5);
+                    let imm7 = ubfx_32(instr, 25, 7);
+                    let imm = (imm7 << 5) | imm5;
+                    let imm = sbfx_32(imm, 0, 20);
+
+                    let rs1 = ubfx_32(instr, 15, 5) as usize;
+                    let rs2 = ubfx_32(instr, 20, 5) as usize;
+
+                    let ptr = self.x.read(rs1).wrapping_add(imm as i32 as i64 as u64);
+                    let ptr = Ptr(ptr);
+
+                    match funct3 {
+                        0b011 => {
+                            self.mem.write(self.mode, ptr, &self.x.read(rs2).to_ne_bytes());
+                        }
+
+
+                        _ => panic!("unkown store"),
+                    }
+                }
+
+
+                // branching
+                0b1100011 => {
+                    let funct3 = ubfx_32(instr, 12, 3);
+                    let rs1 = ubfx_32(instr, 15, 5) as usize;
+                    let rs2 = ubfx_32(instr, 20, 5) as usize;
+                    let imm =
+                        ubfx_32(instr, 7, 1) << 11
+                      | ubfx_32(instr, 8, 4)
+                      | ubfx_32(instr, 25, 6) << 5
+                      | ubfx_32(instr, 31, 1) << 12; // who the fuck wrote this spec bro
+                    let imm = sbfx_64((imm << 1) as u64, 0, 13);
+
+
+                    match funct3 {
+                        0b100 => {
+                            let rs1 = self.x.read(rs1) as i64;
+                            let rs2 = self.x.read(rs2) as i64;
+
+                            if rs1 < rs2 {
+                                self.pc = self.pc.wrapping_add(imm);
+                                continue;
+                            }
+                        }
+
+                        _ => panic!("unknown branch")
+                    }
+
+                }
+
+
+
+                // jumps
+                0b1100111 => {
+                    let funct3 = ubfx_32(instr, 12, 3);
+                    let rs1 = ubfx_32(instr, 15, 5) as usize;
+                    let rd = ubfx_32(instr, 7, 5) as usize;
+                    let imm = sbfx_32(instr, 20, 12) as i64 as u64;
+
+
+                    match funct3 {
+                        // jalr
+                        0b000 => {
+                            let t = self.pc + 4;
+                            self.pc = self.x.read(rs1).wrapping_add(imm) & (!1);
+                            self.x.write(rd, t);
+                            continue;
+                        }
+                        _ => panic!("unknown jump"),
+                    }
                 }
 
 
@@ -448,7 +586,7 @@ impl Emulator {
 
             self.pc += 4;
             self.csr[CSR_CYCLE] += 1;
-            sleep_ms(100);
+            //sleep_ms(100);
         }
     }
 
