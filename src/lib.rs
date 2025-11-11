@@ -23,23 +23,32 @@ pub enum Priv {
 }
 
 
-const CSR_CYCLE  : usize = 0xC00;
+const CSR_MVENDORID : usize = 0xF11;
+const CSR_MARCHID : usize = 0xF12;
+const CSR_MIMPID : usize = 0xF13;
+const CSR_MHARTID : usize = 0xF14;
+
+const CSR_MSTATUS: usize = 0x300;
+const CSR_MISA: usize = 0x301;
+const CSR_MEDELEG: usize = 0x302;
+const CSR_MIDELEG: usize = 0x303;
+const CSR_MIE: usize = 0x304;
+const CSR_MTVEC  : usize = 0x305;
+const CSR_MCOUNTEREN : usize = 0x306;
+const CSR_MSCRATCH : usize = 0x340;
 const CSR_MEPC   : usize = 0x341;
 const CSR_MCAUSE : usize = 0x342;
 const CSR_MTVAL  : usize = 0x343;
-const CSR_MTVEC  : usize = 0x305;
-const CSR_MIE: usize = 0x304;
 const CSR_MIP: usize = 0x344;
-const CSR_MSTATUS: usize = 0x300;
-const CSR_MIDELEG: usize = 0x303;
-const CSR_MEDELEG: usize = 0x302;
+const CSR_MTINST: usize = 0x34A;
+const CSR_MTVAL2: usize = 0x34B;
+
+const CSR_CYCLE  : usize = 0xC00;
 const CSR_SEPC: usize = 0x141;
 const CSR_SCAUSE: usize = 0x142;
 const CSR_STVAL: usize = 0x143;
 const CSR_STVEC: usize = 0x105;
 const CSR_SSTATUS: usize = 0x100;
-const CSR_SSCRATCH: usize = 0x140;
-const CSR_SATP: usize = 0x180;
 
 
 impl Emulator {
@@ -127,8 +136,8 @@ impl Emulator {
 
         self.mem.write(self.mode, Ptr(self.pc), code);
 
-
         loop {
+            //println!("pc: 0x{:x}", self.pc);
             let instr = self.mem.read_u32(Ptr(self.pc));
             let opcode = ubfx_32(instr, 0, 7);
 
@@ -703,7 +712,7 @@ impl Emulator {
                     let funct3 = ubfx_32(instr, 12, 3);
                     let rs1 = ubfx_32(instr, 15, 5) as usize;
                     let rd = ubfx_32(instr, 7, 5) as usize;
-                    let imm = sbfx_32(instr, 20, 12) as i64 as u64;
+                    let imm = sbfx_32(instr, 20, 12) as i32 as i64 as u64;
 
 
                     match funct3 {
@@ -724,7 +733,6 @@ impl Emulator {
 
             self.pc += 4;
             self.csr[CSR_CYCLE] += 1;
-            //sleep_ms(100);
         }
     }
 
