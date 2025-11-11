@@ -3,5 +3,13 @@
 version = 4
 
 [[package]]
+name = "colourful"
+version = "0.1.0"
+source = "git+https://github.com/todaymare/colourful#38f807d2da716294966f039151e8de0af5a3eaa7"
+
+[[package]]
 name = "riscv-emulator"
 version = "0.1.0"
+dependencies = [
+ "colourful",
+]

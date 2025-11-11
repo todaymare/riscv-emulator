@@ -1,7 +1,9 @@
 pub mod mem;
 pub mod utils;
 
-use std::thread::sleep_ms;
+use std::{process::exit, thread::sleep_ms, time::Instant};
+
+use colourful::ColourBrush;
 
 use crate::{mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
@@ -9,7 +11,7 @@ pub struct Emulator {
     mem: Memory,
 
     mode: Priv,
-    x  : Regs,
+    pub x  : Regs,
     pc : u64,
     csr: [u64; 4096],
 }
@@ -51,6 +53,17 @@ const CSR_STVEC: usize = 0x105;
 const CSR_SSTATUS: usize = 0x100;
 
 
+const MTIME   : usize = 0x0200_BFF8;
+const MTIMECMP: usize = 0x0200_4000;
+
+
+const INTERRUPTS: [u64; 3] = [
+    3,  // Machine software
+    7,  // Machine timer
+    11, // Machine external
+];
+
+
 impl Emulator {
     pub fn new() -> Self {
         Self {
@@ -64,6 +77,8 @@ impl Emulator {
     }
 
     pub fn trap(&mut self, cause: u64, tval: u64) {
+        //println!("tripped 0b{cause:b} tval: 0b{tval:b}");
+
         let medeleg = self.csr[CSR_MEDELEG];
         let mideleg = self.csr[CSR_MIDELEG];
 
@@ -130,14 +145,69 @@ impl Emulator {
     }
 
 
-    pub fn run(&mut self, code: &[u8]) {
+    pub fn run(&mut self, code: &[u8]) -> bool {
+        let now = Instant::now();
+
         self.x.write(2, 0xB000_0000);
         self.pc = 0x8000_0000;
+        self.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &100u64.to_ne_bytes());
 
         self.mem.write(self.mode, Ptr(self.pc), code);
 
         loop {
-            //println!("pc: 0x{:x}", self.pc);
+            let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
+            mtime = mtime.wrapping_add(1);
+            self.mem.write(self.mode, Ptr(MTIME as _), &mtime.to_ne_bytes());
+
+            if mtime >= self.mem.read_u64(Ptr(MTIMECMP as _)) {
+                self.csr[CSR_MIP] |= 1 << 7;
+            }
+
+
+            if now.elapsed().as_secs() >= 1 {
+                return false;
+            }
+
+
+            //dbg!(mtime, self.mem.read_u64(Ptr(MTIMECMP as _)));
+            self.csr[CSR_CYCLE] += 1;
+
+
+            // check interrupts
+            let pending = self.csr[CSR_MIP];
+            let enabled = self.csr[CSR_MIE];
+            let global_enabled = ubfx_64(self.csr[CSR_MSTATUS], 3, 1);
+
+            //dbg!(pending, enabled, global_enabled);
+            //dbg!(self.mem.read_u64(Ptr(0x8FFF_FF8F)));
+            //dbg!(self.mem.read_u64(Ptr(0x8FFF_FFFF)));
+
+
+            /*
+            let panic_log_len_ptr = Ptr(0xFFFF_F000);
+            let panic_log_ptr = Ptr(0xFFFF_F010);
+
+            let len = self.mem.read_u32(panic_log_len_ptr);
+
+            if len != 0 {
+                //dbg!(self.mem.read(panic_log_ptr, len as usize));
+            }*/
+
+
+            if (pending & enabled != 0) && global_enabled == 1 {
+                for &code in INTERRUPTS.iter() {
+                    let mask = 1 << code;
+                    if (pending & mask != 0) && (enabled & mask != 0) {
+                        let cause = (1 << 63) | code; // Bit 63 = interrupt
+                        self.trap(cause, 0);
+                        break;
+                    }
+                }
+            }
+
+
+            // execute
+
             let instr = self.mem.read_u32(Ptr(self.pc));
             let opcode = ubfx_32(instr, 0, 7);
 
@@ -180,20 +250,20 @@ impl Emulator {
 
                         0b101 => {
                             let shamt = ubfx_32(instr, 20, 6) & 0x3F;
-                            let funct7 = ubfx_32(instr, 25, 7);
+                            let funct6 = ubfx_32(instr, 26, 6);
 
-                            match funct7 {
+                            match funct6 {
                                 // srli
-                                0b0000000 => {
+                                0b000000 => {
                                     src >> shamt
                                 }
 
                                 // srai
-                                0b0100000 => {
+                                0b010000 => {
                                     (src as i64 >> shamt) as u64
                                 },
 
-                                _ => panic!("invalid funct value"),
+                                _ => panic!("invalid funct value 0b{:b} pc: 0x{:x}", funct6, self.pc),
                             }
                         }
 
@@ -464,13 +534,19 @@ impl Emulator {
 
                                     let num = self.x.read(17);
                                     if num == 93 {
-                                        println!("terminating");
-                                        for x in 0..32 {
-                                            println!("x{x} - {}({:x})", self.x.read(x), self.x.read(x));
-                                        }
-
-                                        println!("CYCLE COUNT: {}", self.csr[CSR_CYCLE]);
                                         break;
+                                    } else if num == 0xCC {
+
+                                        let panic_log_len_ptr = Ptr(0xFFFF_F000);
+                                        let panic_log_ptr = Ptr(0xFFFF_F010);
+
+                                        let len = self.mem.read_u32(panic_log_len_ptr);
+                                        let slice = self.mem.read(panic_log_ptr, len as usize);
+                                        let msg = core::str::from_utf8(slice).unwrap();
+
+                                        panic!("processed paniced: {msg}");
+
+
                                     }
 
                                     self.trap(cause, 0);
@@ -486,17 +562,35 @@ impl Emulator {
                                 // sret
                                 0b00010_00_00010 => {
                                     self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
+                                    continue;
                                 }
 
 
                                 // mret
                                 0b00110_00_00010 => {
                                     self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
+                                    continue;
                                 }
 
                                 // wfi
                                 0b00010_00_00101 => {
-                                    while self.csr[CSR_MIE] & self.csr[CSR_MIP] == 0 {}
+                                    while self.csr[CSR_MIE] & self.csr[CSR_MIP] == 0 {
+                                        let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
+                                        mtime = mtime.wrapping_add(1);
+                                        self.mem.write(self.mode, Ptr(MTIME as _), &mtime.to_ne_bytes());
+
+                                        if mtime >= self.mem.read_u64(Ptr(MTIMECMP as _)) {
+                                            self.csr[CSR_MIP] |= 1 << 7;
+                                        }
+
+
+                                        if now.elapsed().as_secs() >= 1 {
+                                            return false;
+                                        }
+
+
+                                        self.csr[CSR_CYCLE] += 1;
+                                    }
                                 }
 
                                 // sfence.vma
@@ -524,6 +618,7 @@ impl Emulator {
 
                     let ptr = (rs1 as i64 + offset) as u64;
                     let ptr = Ptr(ptr);
+                    //println!("0x{:x} {} 0x{:x}", rs1, offset, ptr.0);
 
                     let result = match funct3 {
                         // lb
@@ -584,6 +679,7 @@ impl Emulator {
                         _ => panic!("unkown load")
                     };
 
+                    //println!("0x{:x}", result);
                     self.x.write(rd as usize, result);
                 }
 
@@ -639,10 +735,10 @@ impl Emulator {
                     let rs2 = ubfx_32(instr, 20, 5) as usize;
                     let imm =
                         ubfx_32(instr, 7, 1) << 11
-                      | ubfx_32(instr, 8, 4)
+                      | ubfx_32(instr, 8, 4) << 1
                       | ubfx_32(instr, 25, 6) << 5
                       | ubfx_32(instr, 31, 1) << 12; // who the fuck wrote this spec bro
-                    let imm = sbfx_64((imm << 1) as u64, 0, 13);
+                    let imm = sbfx_64(imm as u64, 0, 13);
 
 
                     let cond = match funct3 {
@@ -728,12 +824,14 @@ impl Emulator {
                 }
 
 
-                _ => panic!("unkown opcode {opcode:b}"),
+                _ => panic!("unkown opcode {opcode:b} pc: 0x{:x}", self.pc),
             }
 
             self.pc += 4;
-            self.csr[CSR_CYCLE] += 1;
         }
+
+
+        return true;
     }
 
 

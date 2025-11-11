@@ -21,6 +21,7 @@ impl Memory {
         let buff = unsafe { alloc_zeroed(Layout::from_size_align(0xFFFF_FFFF, 8).unwrap()) };
         Self {
             regions: vec![
+                Region::new(0x0200_0000..0x0200_FFFF, Priv::User   ), // clint
                 Region::new(0x8000_0000..0xA000_0000, Priv::Machine), // rom
                 Region::new(0xA000_0000..0xFFFF_FFFF, Priv::User   ), // ram
             ],
@@ -32,6 +33,11 @@ impl Memory {
 
     pub fn read_u32(&mut self, ptr: Ptr) -> u32 {
         u32::from_ne_bytes(self.read(ptr, 4).try_into().unwrap())
+    }
+
+
+    pub fn read_u64(&mut self, ptr: Ptr) -> u64 {
+        u64::from_ne_bytes(self.read(ptr, 8).try_into().unwrap())
     }
 
 
