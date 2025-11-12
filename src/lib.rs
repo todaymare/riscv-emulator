@@ -1,7 +1,7 @@
 pub mod mem;
 pub mod utils;
 
-use std::{process::exit, thread::sleep_ms, time::Instant};
+use std::{ops::Rem, process::exit, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
 
@@ -53,6 +53,12 @@ const CSR_STVEC: usize = 0x105;
 const CSR_SSTATUS: usize = 0x100;
 
 
+const CSR_TSELECT : usize = 0x7A0;
+const CSR_TDATA1  : usize = 0x7A1;
+const CSR_TDATA2  : usize = 0x7A2;
+const CSR_TCONTROL: usize = 0x7A5;
+
+
 const MTIME   : usize = 0x0200_BFF8;
 const MTIMECMP: usize = 0x0200_4000;
 
@@ -77,7 +83,6 @@ impl Emulator {
     }
 
     pub fn trap(&mut self, cause: u64, tval: u64) {
-        //println!("tripped 0b{cause:b} tval: 0b{tval:b}");
 
         let medeleg = self.csr[CSR_MEDELEG];
         let mideleg = self.csr[CSR_MIDELEG];
@@ -137,6 +142,7 @@ impl Emulator {
         let tvec = self.csr[tvec_csr];
         let base = tvec & !0b11;
         let tmode = tvec & 0b11;
+
         if tmode == 1 && interrupt {
             self.pc = base + 4 * code;
         } else {
@@ -145,53 +151,48 @@ impl Emulator {
     }
 
 
+    pub fn tick_timer(&mut self, start: &Instant, last_ns: &mut u128) {
+        self.csr[CSR_CYCLE] += 1;
+
+        if self.csr[CSR_CYCLE] % 100 != 0 { return }
+        let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
+
+        const MTIME_TICK_NS: u128 = 100; // 10MHz
+        let now = start.elapsed().as_nanos();
+        let dt = now - *last_ns;
+
+        let div = dt / MTIME_TICK_NS;
+        let rem = dt % MTIME_TICK_NS;
+
+        mtime = mtime.wrapping_add(div as u64);
+
+        *last_ns = now - rem;
+        self.mem.write(self.mode, Ptr(MTIME as _), &mtime.to_ne_bytes());
+
+        let bit = mtime >= self.mem.read_u64(Ptr(MTIMECMP as _));
+        let bit = bit as u64;
+        self.csr[CSR_MIP] = bfi_64(self.csr[CSR_MIP], 7, 1, bit);
+    }
+
+
     pub fn run(&mut self, code: &[u8]) -> bool {
-        let now = Instant::now();
+        let start = Instant::now();
+        let mut last_ns = 0;
 
         self.x.write(2, 0xB000_0000);
         self.pc = 0x8000_0000;
-        self.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &100u64.to_ne_bytes());
+        self.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
 
         self.mem.write(self.mode, Ptr(self.pc), code);
 
         loop {
-            let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
-            mtime = mtime.wrapping_add(1);
-            self.mem.write(self.mode, Ptr(MTIME as _), &mtime.to_ne_bytes());
-
-            if mtime >= self.mem.read_u64(Ptr(MTIMECMP as _)) {
-                self.csr[CSR_MIP] |= 1 << 7;
-            }
-
-
-            if now.elapsed().as_secs() >= 1 {
-                return false;
-            }
-
-
-            //dbg!(mtime, self.mem.read_u64(Ptr(MTIMECMP as _)));
-            self.csr[CSR_CYCLE] += 1;
+            self.tick_timer(&start, &mut last_ns);
 
 
             // check interrupts
             let pending = self.csr[CSR_MIP];
             let enabled = self.csr[CSR_MIE];
             let global_enabled = ubfx_64(self.csr[CSR_MSTATUS], 3, 1);
-
-            //dbg!(pending, enabled, global_enabled);
-            //dbg!(self.mem.read_u64(Ptr(0x8FFF_FF8F)));
-            //dbg!(self.mem.read_u64(Ptr(0x8FFF_FFFF)));
-
-
-            /*
-            let panic_log_len_ptr = Ptr(0xFFFF_F000);
-            let panic_log_ptr = Ptr(0xFFFF_F010);
-
-            let len = self.mem.read_u32(panic_log_len_ptr);
-
-            if len != 0 {
-                //dbg!(self.mem.read(panic_log_ptr, len as usize));
-            }*/
 
 
             if (pending & enabled != 0) && global_enabled == 1 {
@@ -208,8 +209,16 @@ impl Emulator {
 
             // execute
 
+            //println!("pc: 0x{:x}", self.pc);
             let instr = self.mem.read_u32(Ptr(self.pc));
             let opcode = ubfx_32(instr, 0, 7);
+
+            macro_rules! unknown_opcode {
+                () => {{
+                    self.trap(2, instr as u64);
+                    continue;
+                }};
+            }
 
             match opcode {
                 // register-imm arithm
@@ -263,11 +272,11 @@ impl Emulator {
                                     (src as i64 >> shamt) as u64
                                 },
 
-                                _ => panic!("invalid funct value 0b{:b} pc: 0x{:x}", funct6, self.pc),
+                                _ => unknown_opcode!(),
                             }
                         }
 
-                        _ => panic!("unkown iinstr"),
+                        _ => unknown_opcode!(),
                     };
 
                     self.x.write(dst, result);
@@ -291,26 +300,26 @@ impl Emulator {
 
                         // slliw
                         0b001 => {
-                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            let shamt = ubfx_32(instr, 20, 5);
                             (rs1 << shamt) as u32
                         }
 
 
                         // srliw
                         0b101 if funct7 == 0b00000_00 => {
-                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            let shamt = ubfx_32(instr, 20, 5);
                             rs1 as u32 >> shamt
                         }
 
 
                         // sraiw
                         0b101 if funct7 == 0b01000_00 => {
-                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            let shamt = ubfx_32(instr, 20, 5);
                             (rs1 as i32 >> shamt) as u32
                         }
 
 
-                        _ => panic!("unknown iinstrpt2")
+                        _ => unknown_opcode!()
                     };
 
 
@@ -364,7 +373,7 @@ impl Emulator {
                         // and
                         0b0000000_111 => rs1 & rs2,
 
-                        _ => panic!("unkown rinstr"),
+                        _ => unknown_opcode!(),
                     };
 
                     self.x.write(dst, result);
@@ -384,13 +393,13 @@ impl Emulator {
 
                     let result = match funct3 {
                         // addw
-                        0b000 if funct7 == 0b00000_00 => {
+                        0b000 if funct7 == 0b0000_000 => {
                             let result = (rs1 as u32).wrapping_add(rs2 as u32);
                             result
                         }
 
                         // subw
-                        0b000 if funct7 == 0b10000_00 => {
+                        0b000 if funct7 == 0b0100_000 => {
                             let result = (rs1 as u32).wrapping_sub(rs2 as u32);
                             result
                         }
@@ -398,7 +407,7 @@ impl Emulator {
 
                         // sllw
                         0b001 => {
-                            let shamt = rs2 & 0x3F;
+                            let shamt = rs2 & 0x1F;
                             (rs1 << shamt) as u32
                         }
 
@@ -408,14 +417,14 @@ impl Emulator {
                             rs1 as u32 >> shamt
                         }
 
-                        // sraiw
+                        // sraw
                         0b101 if funct7 == 0b01000_00 => {
-                            let shamt = ubfx_32(instr, 20, 6) & 0x1F;
+                            let shamt = rs2 & 0x1F;
                             (rs1 as i32 >> shamt) as u32
                         }
 
 
-                        _ => panic!("unkown rinstrpt2")
+                        _ => unknown_opcode!(), 
                     };
 
 
@@ -521,10 +530,13 @@ impl Emulator {
 
 
                         0b000 => {
+                            //dbg!("gheyy");
                             let funct12 = ubfx_32(instr, 20, 12);
+                            //println!("0b{funct12:<012b}");
                             match funct12 {
                                 // ecall
                                 0b00000_00_00000 => {
+                                    //println!("ecall");
                                     let cause = match self.mode {
                                         Priv::User        => 8,
                                         Priv::Supervisor  => 9,
@@ -544,7 +556,7 @@ impl Emulator {
                                         let slice = self.mem.read(panic_log_ptr, len as usize);
                                         let msg = core::str::from_utf8(slice).unwrap();
 
-                                        panic!("processed paniced: {msg}");
+                                        panic!("{msg}");
 
 
                                     }
@@ -575,32 +587,18 @@ impl Emulator {
                                 // wfi
                                 0b00010_00_00101 => {
                                     while self.csr[CSR_MIE] & self.csr[CSR_MIP] == 0 {
-                                        let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
-                                        mtime = mtime.wrapping_add(1);
-                                        self.mem.write(self.mode, Ptr(MTIME as _), &mtime.to_ne_bytes());
-
-                                        if mtime >= self.mem.read_u64(Ptr(MTIMECMP as _)) {
-                                            self.csr[CSR_MIP] |= 1 << 7;
-                                        }
-
-
-                                        if now.elapsed().as_secs() >= 1 {
-                                            return false;
-                                        }
-
-
-                                        self.csr[CSR_CYCLE] += 1;
+                                        self.tick_timer(&start, &mut last_ns);
                                     }
                                 }
 
                                 // sfence.vma
-                                _ if ubfx_32(instr, 25, 7) == 0b0001001 => {},
+                                _ if ubfx_32(instr, 25, 7) == 0b0001001 => (), 
 
-                                _ => panic!("unknown system instruction"),
+                                _ => unknown_opcode!(),
                             }
                         }
 
-                        _ => panic!("invalid csr instruction"),
+                        _ => unknown_opcode!(),
                     };
 
 
@@ -618,13 +616,11 @@ impl Emulator {
 
                     let ptr = (rs1 as i64 + offset) as u64;
                     let ptr = Ptr(ptr);
-                    //println!("0x{:x} {} 0x{:x}", rs1, offset, ptr.0);
 
                     let result = match funct3 {
                         // lb
                         0b000 => {
                             let byte = self.mem.read(ptr, 1)[0];
-
                             byte as i8 as i64 as u64
                         }
 
@@ -676,7 +672,7 @@ impl Emulator {
                             value
                         }
 
-                        _ => panic!("unkown load")
+                        _ => unknown_opcode!()
                     };
 
                     //println!("0x{:x}", result);
@@ -690,13 +686,15 @@ impl Emulator {
                     let imm5 = ubfx_32(instr, 7, 5);
                     let imm7 = ubfx_32(instr, 25, 7);
                     let imm = (imm7 << 5) | imm5;
-                    let imm = sbfx_32(imm, 0, 20);
+                    let imm = sbfx_32(imm, 0, 12);
+                    let imm = imm as i32 as i64 as u64;
 
                     let rs1 = ubfx_32(instr, 15, 5) as usize;
                     let rs2 = ubfx_32(instr, 20, 5) as usize;
 
-                    let ptr = self.x.read(rs1).wrapping_add(imm as i32 as i64 as u64);
+                    let ptr = self.x.read(rs1).wrapping_add(imm);
                     let ptr = Ptr(ptr);
+
 
                     match funct3 {
                         // sb
@@ -723,7 +721,7 @@ impl Emulator {
                         }
 
 
-                        _ => panic!("unkown store"),
+                        _ => unknown_opcode!(),
                     }
                 }
 
@@ -792,7 +790,7 @@ impl Emulator {
                         }
 
 
-                        _ => panic!("unknown branch")
+                        _ => unknown_opcode!()
                     };
 
                     if cond {
@@ -819,12 +817,12 @@ impl Emulator {
                             self.x.write(rd, t);
                             continue;
                         }
-                        _ => panic!("unknown jump"),
+                        _ => unknown_opcode!(),
                     }
                 }
 
 
-                _ => panic!("unkown opcode {opcode:b} pc: 0x{:x}", self.pc),
+                _ => unknown_opcode!(),
             }
 
             self.pc += 4;
@@ -885,3 +883,21 @@ impl Regs {
     }
 }
 
+
+#[inline(always)]
+fn read_cntvct() -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) value);
+    }
+    value
+}
+
+#[inline(always)]
+fn read_cntfrq() -> u64 {
+    let freq: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
+    }
+    freq
+}

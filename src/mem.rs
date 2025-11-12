@@ -22,7 +22,7 @@ impl Memory {
         Self {
             regions: vec![
                 Region::new(0x0200_0000..0x0200_FFFF, Priv::User   ), // clint
-                Region::new(0x8000_0000..0xA000_0000, Priv::Machine), // rom
+                Region::new(0x8000_0000..0xA000_0000, Priv::User   ), // rom
                 Region::new(0xA000_0000..0xFFFF_FFFF, Priv::User   ), // ram
             ],
 

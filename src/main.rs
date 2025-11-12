@@ -46,6 +46,7 @@ fn main() {
                 let bucket = path.file_name().unwrap().to_str().unwrap();
                 let bucket = bucket.split_once('-').unwrap().0;
                 if !buckets.contains_key(bucket) {
+                    println!();
                     buckets.insert(bucket.to_string(), Bucket::default());
                 }
 
