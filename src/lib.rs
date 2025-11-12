@@ -404,13 +404,13 @@ impl Emulator {
 
                         // srlw
                         0b101 if funct7 == 0b00000_00  => {
-                            let shamt = rs2 & 0x3F;
+                            let shamt = rs2 & 0x1F;
                             rs1 as u32 >> shamt
                         }
 
                         // sraiw
                         0b101 if funct7 == 0b01000_00 => {
-                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
+                            let shamt = ubfx_32(instr, 20, 6) & 0x1F;
                             (rs1 as i32 >> shamt) as u32
                         }
 
