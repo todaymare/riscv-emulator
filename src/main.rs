@@ -352,7 +352,6 @@ impl ApplicationHandler for App<'_> {
                 loop {
                     let is_frame_ready = self.mem.read_u8(settings);
                     if is_frame_ready == 1 {
-                        self.mem.write(riscv_emulator::Priv::Machine, settings, &[0]);
                         break;
                     }
 
@@ -368,9 +367,8 @@ impl ApplicationHandler for App<'_> {
                 let buf = data.pixels.frame_mut();
                 let ptr = Ptr(0x1000_00FF);
 
-                for i in 0..buf.len() {
-                    buf[i] = self.mem.read_u8(Ptr(ptr.0 + i as u64));
-                }
+                buf.copy_from_slice(self.mem.read(ptr, buf.len()));
+                self.mem.write(riscv_emulator::Priv::Machine, settings, &[0]);
 
                 data.pixels.render().unwrap();
 
