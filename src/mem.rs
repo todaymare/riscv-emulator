@@ -41,55 +41,22 @@ impl Memory {
 
 
     pub fn read_u8(&self, ptr: Ptr) -> u8 {
-        let slice = self.read(ptr, 1);
-        //slice[0].load(std::sync::atomic::Ordering::Relaxed)
-        slice[0]
+        self.read_sized::<1>(ptr)[0]
     }
 
 
     pub fn read_u16(&self, ptr: Ptr) -> u16 {
-        let slice = self.read(ptr, 2);
-        /*
-        let slice = [
-            slice[0].load(std::sync::atomic::Ordering::Relaxed),
-            slice[1].load(std::sync::atomic::Ordering::Relaxed),
-        ];*/
-
-        u16::from_ne_bytes(slice.try_into().unwrap())
+        u16::from_ne_bytes(self.read_sized(ptr))
     }
 
 
     pub fn read_u32(&self, ptr: Ptr) -> u32 {
-        let slice = self.read(ptr, 4);
-        /*
-        let slice = [
-            slice[0].load(std::sync::atomic::Ordering::Relaxed),
-            slice[1].load(std::sync::atomic::Ordering::Relaxed),
-            slice[2].load(std::sync::atomic::Ordering::Relaxed),
-            slice[3].load(std::sync::atomic::Ordering::Relaxed),
-        ];
-        */
-
-        u32::from_ne_bytes(slice.try_into().unwrap())
+        u32::from_ne_bytes(self.read_sized(ptr))
     }
 
 
     pub fn read_u64(&self, ptr: Ptr) -> u64 {
-        let slice = self.read(ptr, 8);
-        /*
-        unsafe { core::hint::assert_unchecked(slice.len() == 8) };
-        let slice = [
-            slice[0].load(std::sync::atomic::Ordering::Relaxed),
-            slice[1].load(std::sync::atomic::Ordering::Relaxed),
-            slice[2].load(std::sync::atomic::Ordering::Relaxed),
-            slice[3].load(std::sync::atomic::Ordering::Relaxed),
-            slice[4].load(std::sync::atomic::Ordering::Relaxed),
-            slice[5].load(std::sync::atomic::Ordering::Relaxed),
-            slice[6].load(std::sync::atomic::Ordering::Relaxed),
-            slice[7].load(std::sync::atomic::Ordering::Relaxed),
-        ];*/
-
-        u64::from_ne_bytes(slice.try_into().unwrap())
+        u64::from_ne_bytes(self.read_sized(ptr))
     }
 
 
@@ -119,15 +86,12 @@ impl Memory {
     pub fn read_sized<const N: usize>(&self, ptr: Ptr) -> [u8; N] {
         for region in &self.regions {
             if region.range.contains(&ptr.0) {
-                assert!(ptr.0 <= region.range.end - size as u64);
+                assert!(ptr.0 <= region.range.end - N as u64);
 
                 unsafe {
-                let mut arr = [0; N];
-
-                let mut ptr = self.buff.0.add(ptr.0 as usize);
+                let mut ptr = self.buff.0.add(ptr.0 as usize).cast();
                 core::hint::black_box(&mut ptr);
-                let slice = core::slice::from_raw_parts(ptr, size);
-                return slice;
+                return *ptr;
 
                 }
 

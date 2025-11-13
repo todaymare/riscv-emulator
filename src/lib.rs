@@ -151,14 +151,18 @@ impl Emulator {
     }
 
 
-    pub fn tick_timer(&mut self, start: &Instant, last_ns: &mut u128) {
+    pub fn tick_timer(&mut self, start: &Instant, timeout_ms: u64, last_ns: &mut u128) -> bool {
         self.csr[CSR_CYCLE] += 1;
 
-        if self.csr[CSR_CYCLE] % 100 != 0 { return }
+        if self.csr[CSR_CYCLE] % 100 != 0 { return true }
         let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
 
         const MTIME_TICK_NS: u128 = 100; // 10MHz
-        let now = start.elapsed().as_nanos();
+        let elapsed = start.elapsed();
+
+        if elapsed.as_millis() as u64 > timeout_ms { return false }
+
+        let now = elapsed.as_nanos();
         let dt = now - *last_ns;
 
         let div = dt / MTIME_TICK_NS;
@@ -172,6 +176,7 @@ impl Emulator {
         let bit = mtime >= self.mem.read_u64(Ptr(MTIMECMP as _));
         let bit = bit as u64;
         self.csr[CSR_MIP] = bfi_64(self.csr[CSR_MIP], 7, 1, bit);
+        true
     }
 
 
@@ -186,10 +191,8 @@ impl Emulator {
         self.mem.write(self.mode, Ptr(self.pc), code);
 
         loop {
-            self.tick_timer(&start, &mut last_ns);
-
-
-            if start.elapsed().as_millis() as u64 >= timeout_ms { return false }
+            let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
+            if !cont { return false }
 
 
             // check interrupts
@@ -614,7 +617,7 @@ impl Emulator {
                     offset = bfi_32(offset, 12, 8, ubfx_32(instr, 12, 8));   // imm[19:12]
                     offset = bfi_32(offset, 11, 1, ubfx_32(instr, 20, 1));   // imm[11]
                     offset = bfi_32(offset, 1, 10, ubfx_32(instr, 21, 10));  // imm[10:1]
-                    offset = sbfx_32(offset, 0, 20);
+                    offset = sbfx_32(offset, 0, 21);
 
                     self.x.write(rd, self.pc.wrapping_add(4));
                     self.pc = self.pc.wrapping_add(offset as i32 as u64);
@@ -764,8 +767,8 @@ impl Emulator {
                                 // wfi
                                 0b00010_00_00101 => {
                                     while self.csr[CSR_MIE] & self.csr[CSR_MIP] == 0 {
-                                        if start.elapsed().as_millis() as u64 >= timeout_ms { return false }
-                                        self.tick_timer(&start, &mut last_ns);
+                                        let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
+                                        if !cont { return false }
                                     }
                                 }
 
