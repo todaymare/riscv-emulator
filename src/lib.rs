@@ -1,15 +1,18 @@
+#![feature(likely_unlikely)]
 pub mod mem;
 pub mod utils;
+pub mod instrs;
 
 use std::{ops::Rem, process::exit, sync::Arc, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
 
-use crate::{mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
+use crate::{instrs::{Instr, InstrCache}, mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
 pub struct Emulator {
     pub mem: Arc<Memory>,
 
+    cache: InstrCache,
     mode: Priv,
     pub x  : Regs,
     pc : u64,
@@ -59,6 +62,33 @@ const CSR_TDATA2  : usize = 0x7A2;
 const CSR_TCONTROL: usize = 0x7A5;
 
 
+const EXC_INSTR_ADDR_MISALIGNED: u64 = 0;
+const EXC_INSTR_ACCESS_FAULT:     u64 = 1;
+const EXC_ILLEGAL_INSTRUCTION:    u64 = 2;
+const EXC_BREAKPOINT:             u64 = 3;
+const EXC_LOAD_ADDR_MISALIGNED:   u64 = 4;
+const EXC_LOAD_ACCESS_FAULT:      u64 = 5;
+const EXC_STORE_ADDR_MISALIGNED:  u64 = 6;
+const EXC_STORE_ACCESS_FAULT:     u64 = 7;
+const EXC_ECALL_UMODE:            u64 = 8;
+const EXC_ECALL_SMODE:            u64 = 9;
+// 10 is reserved
+const EXC_ECALL_MMODE:            u64 = 11;
+const EXC_INSTR_PAGE_FAULT:       u64 = 12;
+const EXC_LOAD_PAGE_FAULT:        u64 = 13;
+// 14 reserved
+const EXC_STORE_PAGE_FAULT:       u64 = 15;
+
+
+const INT_SOFT_S: u64 = 1;
+const INT_SOFT_M: u64 = 3;
+
+const INT_TIMER_S: u64 = 5;
+const INT_TIMER_M: u64 = 7;
+
+const INT_EXT_S: u64 = 9;
+const INT_EXT_M: u64 = 11;
+
 const MTIME   : usize = 0x0200_BFF8;
 const MTIMECMP: usize = 0x0200_4000;
 
@@ -78,14 +108,15 @@ impl Emulator {
             pc: 0,
             csr: [0; _],
             mode: Priv::Machine,
+            cache: InstrCache::new(),
             
         }
     }
 
     pub fn trap(&mut self, cause: u64, tval: u64) {
 
-        let medeleg = self.csr[CSR_MEDELEG];
-        let mideleg = self.csr[CSR_MIDELEG];
+        let medeleg = self.csr_read(CSR_MEDELEG);
+        let mideleg = self.csr_read(CSR_MIDELEG);
 
         let interrupt = (cause >> 63) != 0;
         let code = cause & (u64::MAX >> 1);
@@ -110,41 +141,41 @@ impl Emulator {
     }
 
 
-
     fn _trap(
         &mut self, status_csr: usize, epc_csr: usize, cause_csr: usize,
         tval_csr: usize, tvec_csr: usize, ie_bit: u32, pie_bit: u32,
         pp_bit: u32, pp_len: u32, new_mode: Priv, cause: u64, tval: u64
     ) {
-        let interrupt = (cause >> 63) != 0;
-        let code = cause & (u64::MAX >> 1);
+        let interrupt = (cause >> 63) & 1;
+        let raw_code  = cause & 0x7FFF_FFFF_FFFF_FFFF;
+        let code5     = raw_code & 0x1F;
 
+        // real mcause value
+        let mcause = (interrupt << 63) | code5;
 
-        let mut status = self.csr[status_csr];
+        // read & update status
+        let mut status = self.csr_read(status_csr);
         let ie = ubfx_64(status, ie_bit, 1);
 
-        // xPIE = xIE
         status = bfi_64(status, pie_bit, 1, ie);
-        // xIE = 0
         status = bfi_64(status, ie_bit, 1, 0);
-        // xPP = previous mode
         status = bfi_64(status, pp_bit, pp_len, self.mode as u64);
 
-        self.csr[status_csr] = status;
-        self.csr[epc_csr] = self.pc;
-        self.csr[cause_csr] = cause;
-        self.csr[tval_csr] = tval;
+        self.csr_write(status_csr, status);
+        self.csr_write(epc_csr, self.pc);
+        self.csr_write(cause_csr, mcause);
+        self.csr_write(tval_csr, tval);
 
-        // Enter new privilege mode
+        // switch privilege
         self.mode = new_mode;
 
-        // Set PC from trap vector
-        let tvec = self.csr[tvec_csr];
+        // redirect PC
+        let tvec = self.csr_read(tvec_csr);
         let base = tvec & !0b11;
         let tmode = tvec & 0b11;
 
-        if tmode == 1 && interrupt {
-            self.pc = base + 4 * code;
+        if tmode == 1 && interrupt != 0 {
+            self.pc = base + 4 * code5;
         } else {
             self.pc = base;
         }
@@ -152,9 +183,10 @@ impl Emulator {
 
 
     pub fn tick_timer(&mut self, start: &Instant, timeout_ms: u64, last_ns: &mut u128) -> bool {
-        self.csr[CSR_CYCLE] += 1;
+        let cycle = self.csr_read(CSR_CYCLE) + 1;
+        self.csr_write(CSR_CYCLE, cycle);
 
-        if self.csr[CSR_CYCLE] % 100 != 0 { return true }
+        if cycle % 10000 != 0 { return true }
         let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
 
         const MTIME_TICK_NS: u128 = 100; // 10MHz
@@ -175,12 +207,14 @@ impl Emulator {
 
         let bit = mtime >= self.mem.read_u64(Ptr(MTIMECMP as _));
         let bit = bit as u64;
-        self.csr[CSR_MIP] = bfi_64(self.csr[CSR_MIP], 7, 1, bit);
+        let mip = bfi_64(self.csr_read(CSR_MIP), 7, 1, bit);
+        self.csr_write(CSR_MIP, mip);
         true
     }
+    
 
 
-    pub fn run(&mut self, timeout_ms: u64, code: &[u8]) -> bool {
+    pub fn new_run(&mut self, timeout_ms: u64, code: &[u8]) -> bool {
         let start = Instant::now();
         let mut last_ns = 0;
 
@@ -196,9 +230,9 @@ impl Emulator {
 
 
             // check interrupts
-            let pending = self.csr[CSR_MIP];
-            let enabled = self.csr[CSR_MIE];
-            let global_enabled = ubfx_64(self.csr[CSR_MSTATUS], 3, 1);
+            let pending = self.csr_read(CSR_MIP);
+            let enabled = self.csr_read(CSR_MIE);
+            let global_enabled = ubfx_64(self.csr_read(CSR_MSTATUS), 3, 1);
 
 
             if (pending & enabled != 0) && global_enabled == 1 {
@@ -213,798 +247,780 @@ impl Emulator {
             }
 
 
-            // execute
-
-            //println!("pc: 0x{:x}", self.pc);
-            let instr = self.mem.read_u32(Ptr(self.pc));
-            let opcode = ubfx_32(instr, 0, 7);
-
-            macro_rules! unknown_opcode {
-                () => {{
-                    self.trap(2, instr as u64);
-                    continue;
-                }};
+            // decode
+            if (self.pc & 0b11) != 0 {
+                self.trap(EXC_INSTR_ADDR_MISALIGNED, self.pc);
+                continue;
             }
 
-            match opcode {
-                // register-imm arithm
-                0b0010011 => {
-                    let funct = ubfx_32(instr, 12, 3);
-                    let dst = ubfx_32(instr,  7,  5) as usize;
-                    let src = ubfx_32(instr, 15,  5) as usize;
-                    let src = self.x.read(src);
-                    let imm = sbfx_64(instr as u64, 20, 12);
+            let instr = self.cache.decode(&self.mem, self.pc);
 
-                    let result = match funct {
-                        // add
-                        0b000 => src.wrapping_add(imm),
-
-                        // slti
-                        0b010 => ((src as i64) < (imm as i64)) as u64,
-
-                        // sltiu
-                        0b011 => (src < imm) as u64,
-
-
-                        // xori
-                        0b100 => src ^ imm,
-
-                        // ori
-                        0b110 => src | imm,
-
-                        // andi
-                        0b111 => src & imm,
-
-
-                        // slli
-                        0b001 => {
-                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
-                            src << shamt
-                        }
-
-
-                        0b101 => {
-                            let shamt = ubfx_32(instr, 20, 6) & 0x3F;
-                            let funct6 = ubfx_32(instr, 26, 6);
-
-                            match funct6 {
-                                // srli
-                                0b000000 => {
-                                    src >> shamt
-                                }
-
-                                // srai
-                                0b010000 => {
-                                    (src as i64 >> shamt) as u64
-                                },
-
-                                _ => unknown_opcode!(),
-                            }
-                        }
-
-                        _ => unknown_opcode!(),
-                    };
-
-                    self.x.write(dst, result);
+            // execute
+            match instr {
+                Instr::IAdd { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        self.x.read(rs1 as usize).wrapping_add(imm as i64 as u64)
+                    )
                 },
 
 
-                // register-imm arithm pt2
-                0b0011011 => {
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let funct7 = ubfx_32(instr, 25, 7);
-                    let rd  = ubfx_32(instr,  7,  5) as usize;
-                    let rs1 = ubfx_32(instr, 15,  5) as usize;
-                    let rs1 = self.x.read(rs1 as usize);
-                    let imm = sbfx_64(instr as u64, 20, 12);
-
-                    let result = match funct3 {
-                        // addiw
-                        0b000 => {
-                            rs1.wrapping_add(imm as i64 as u64) as u32
-                        }
-
-                        // slliw
-                        0b001 => {
-                            let shamt = ubfx_32(instr, 20, 5);
-                            (rs1 << shamt) as u32
-                        }
-
-
-                        // srliw
-                        0b101 if funct7 == 0b00000_00 => {
-                            let shamt = ubfx_32(instr, 20, 5);
-                            rs1 as u32 >> shamt
-                        }
-
-
-                        // sraiw
-                        0b101 if funct7 == 0b01000_00 => {
-                            let shamt = ubfx_32(instr, 20, 5);
-                            (rs1 as i32 >> shamt) as u32
-                        }
-
-
-                        _ => unknown_opcode!()
-                    };
-
-
-                    self.x.write(rd, result as i32 as i64 as u64);
-
-
-                }
-
-
-                // register-register arithm
-                0b0110011 => {
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let funct7 = ubfx_32(instr, 25, 7);
-                    let funct = funct7 << 3 | funct3;
-
-                    let rs1    = ubfx_32(instr, 15, 5) as usize;
-                    let rs2    = ubfx_32(instr, 20, 5) as usize;
-                    let rs1    = self.x.read(rs1);
-                    let rs2    = self.x.read(rs2);
-                    let dst    = ubfx_32(instr,  7, 5) as usize;
-
-
-                    let result = match funct {
-                        // add
-                        0b0000000_000 => rs1.wrapping_add(rs2),
-
-                        // sub
-                        0b0100000_000 => rs1.wrapping_sub(rs2),
-
-                        // sll
-                        0b0000000_001 => rs1 << (rs2 & 0x3F),
-
-                        // slt
-                        0b0000000_010 => ((rs1 as i64) < (rs2 as i64)) as u64,
-
-                        // slut
-                        0b0000000_011 => (rs1 < rs2) as u64,
-
-                        // xor
-                        0b0000000_100 => rs1 ^ rs2,
-
-                        // srl
-                        0b0000000_101 => rs1 >> (rs2 & 0x3F),
-
-                        // sra
-                        0b0100000_101 => ((rs1 as i64) >> (rs2 & 0x3F)) as u64,
-
-                        // or
-                        0b0000000_110 => rs1 | rs2,
-
-                        // and
-                        0b0000000_111 => rs1 & rs2,
-
-                        // mul
-                        0b0000001_000 => rs1.wrapping_mul(rs2),
-
-
-                        // mulh
-                        0b0000001_001 => {
-                            let a = rs1 as i64 as i128;
-                            let b = rs2 as i64 as i128;
-                            let product = a * b;
-                            let high = (product >> 64) as i64 as u64;
-                            high
-                        }
-
-
-                        // mulhsu
-                        0b0000001_010 => {
-                            let a = rs1 as i64 as i128;
-                            let b = rs2 as u64 as u128;
-
-                            let b128 = b as i128;
-
-                            let product = a * b128;
-                            let high = (product >> 64) as u64;
-                            high
-                        }
-
-
-                        // mulhu
-                        0b0000001_011 => {
-                            let a = rs1 as u128;
-                            let b = rs2 as u128;
-
-                            let product = a * b;
-                            let high = (product >> 64) as u64;
-                            high
-                        }
-
-
-                        // div
-                        0b0000001_100 => {
-                            let a = rs1 as i64;
-                            let b = rs2 as i64;
-
-                            let result = if b == 0 {
-                                // division by zero = all 1s
-                                u64::MAX
-                            } else if a == i64::MIN && b == -1 {
-                                // signed overflow = dividend unchanged
-                                a as u64
-                            } else {
-                                (a / b) as u64
-                            };
-
-                            result
-                        }
-
-
-                        // divu
-                        0b0000001_101 => {
-                            let result = if rs2 == 0 {
-                                // division by zero = all 1s
-                                u64::MAX
-                            } else {
-                                (rs1 / rs2) as u64
-                            };
-
-                            result
-                        }
-
-
-                        // rem
-                        0b0000001_110 => {
-                            let a = rs1 as i64;
-                            let b = rs2 as i64;
-
-                            let result = if b == 0 {
-                                a as u64
-                            } else if a == i64::MIN && b == -1 {
-                                0   // overflow remainder is 0
-                            } else {
-                                (a % b) as u64
-                            };
-
-                            result
-                        }
-
-
-                        // remu
-                        0b0000001_111 => {
-                            let a = rs1;
-                            let b = rs2;
-
-                            let result = if b == 0 {
-                                a   // remainder = dividend
-                            } else {
-                                a % b
-                            };
-
-                            result
-                        }
-
-                        _ => unknown_opcode!(),
-                    };
-
-                    self.x.write(dst, result);
-                }
-
-
-                // register-register arithm pt2
-                0b0111011 => {
-                    let funct7 = ubfx_32(instr, 25, 7);
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let funct10 = funct7 << 3 | funct3;
-
-                    let rs1    = ubfx_32(instr, 15, 5) as usize;
-                    let rs2    = ubfx_32(instr, 20, 5) as usize;
-                    let rs1    = self.x.read(rs1);
-                    let rs2    = self.x.read(rs2);
-                    let rd     = ubfx_32(instr,  7, 5) as usize;
-
-
-                    let result = match funct10 {
-                        // addw
-                        0b0000000_000 => {
-                            let result = (rs1 as u32).wrapping_add(rs2 as u32);
-                            result
-                        }
-
-                        // subw
-                        0b0100000_000 => {
-                            let result = (rs1 as u32).wrapping_sub(rs2 as u32);
-                            result
-                        }
-
-
-                        // mulw
-                        0b0000001_000 => {
-                            let a = rs1 as i32 as i64;
-                            let b = rs2 as i32 as i64;
-
-                            let result = (a.wrapping_mul(b)) as i32;
-                            result as u32
-                        }
-
-
-                        // divw 
-                        0b0000001_100 => {
-                            let a = rs1 as i32;
-                            let b = rs2 as i32;
-
-                            let result = if b == 0 {
-                                -1
-                            } else if a == i32::MIN && b == -1 {
-                                i32::MIN
-                            } else {
-                                a.wrapping_div(b)
-                            };
-
-                            result as u32
-                        }
-
-
-                        // divuw 
-                        0b0000001_101 => {
-                            if rs2 == 0 {
-                                u32::MAX
-                            } else {
-                                rs1 as u32 / rs2 as u32
-                            }
-                        }
-
-
-                        // remw
-                        0b0000001_110 => {
-                            let a = rs1 as i32;
-                            let b = rs2 as i32;
-
-                            let result = if b == 0 {
-                                a
-                            } else if a == i32::MIN && b == -1 {
-                                0
-                            } else {
-                                a.wrapping_rem(b)
-                            };
-
-                            result as u32
-                        }
-
-
-                        // remuw 
-                        0b0000001_111 => {
-                            if rs2 == 0 {
-                                rs1 as u32
-                            } else {
-                                rs1 as u32 % rs2 as u32
-                            }
-                        }
-
-
-
-
-                        // sllw
-                        0b0000000_001 => {
-                            let shamt = rs2 & 0x1F;
-                            (rs1 << shamt) as u32
-                        }
-
-                        // srlw
-                        0b0000000_101 => {
-                            let shamt = rs2 & 0x1F;
-                            rs1 as u32 >> shamt
-                        }
-
-                        // sraw
-                        0b0100000_101 => {
-                            let shamt = rs2 & 0x1F;
-                            (rs1 as i32 >> shamt) as u32
-                        }
-
-
-                        _ => unknown_opcode!(), 
-                    };
-
-
-                    self.x.write(rd, result as i32 as i64 as u64);
-                }
-
-
-                // jal
-                0b1101111 => {
-                    let rd = ubfx_32(instr, 7, 5) as usize;
-
-                    let mut offset = 0;
-
-                    offset = bfi_32(offset, 20, 1, ubfx_32(instr, 31, 1));   // imm[20]
-                    offset = bfi_32(offset, 12, 8, ubfx_32(instr, 12, 8));   // imm[19:12]
-                    offset = bfi_32(offset, 11, 1, ubfx_32(instr, 20, 1));   // imm[11]
-                    offset = bfi_32(offset, 1, 10, ubfx_32(instr, 21, 10));  // imm[10:1]
-                    offset = sbfx_32(offset, 0, 21);
-
-                    self.x.write(rd, self.pc.wrapping_add(4));
-                    self.pc = self.pc.wrapping_add(offset as i32 as u64);
-                    continue;
-                }
-
-
-                // lui
-                0b0110111 => {
-                    let rd = ubfx_32(instr, 7, 5) as usize;
-                    let imm = ubfx_32(instr, 12, 20);
-                    let imm = ((imm as i32) << 12) as i64 as u64;
-                    self.x.write(rd, imm);
-                }
-
-
-                // auipc
-                0b0010111 => {
-                    let rd = ubfx_32(instr, 7, 5) as usize;
-                    let imm = ubfx_32(instr, 12, 20);
-                    let imm = ((imm as i32) << 12) as i64 as u64;
-                    self.x.write(rd, self.pc.wrapping_add(imm));
-                }
-
-
-                // fence & fence.i
-                0b0001111 => {
-                    // WHAT THE FUCK IS A FENCE RAAAAA
-                }
-
-
-                0b1110011 => {
-                    let csr = ubfx_32(instr, 20, 12) as usize;
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let rs1 = ubfx_32(instr, 15, 5) as usize;
-                    let rd = ubfx_32(instr, 7, 5) as usize;
-                    let t = self.csr[csr];
-
-                    match funct3 {
-                        // csrrw
-                        0b001 => {
-                            self.csr[csr] = self.x.read(rs1);
-                        }
-
-
-                        // csrrs 
-                        0b010 => {
-                            if rs1 != 0 {
-                                self.csr[csr] = t | self.x.read(rs1);
-                            }
-                        }
-
-
-                        // csrrc
-                        0b011 => {
-                            if rs1 != 0 {
-                                self.csr[csr] = t & !self.x.read(rs1);
-                            }
-                        }
-
-
-                        // csrrwi
-                        0b101 => {
-                            let zimm = ubfx_32(instr, 15, 5) as u64;
-                            self.csr[csr] = zimm;
-                        }
-
-
-                        // csrrsi
-                        0b110 => {
-                            let zimm = ubfx_32(instr, 15, 5) as u64;
-                            if zimm != 0 {
-                                self.csr[csr] = t | zimm;
-                            }
-                        }
-
-
-                        // csrrci
-                        0b111 => {
-                            let zimm = ubfx_32(instr, 15, 5) as u64;
-                            if zimm != 0 {
-                                self.csr[csr] = t & !zimm;
-                            }
-                        }
-
-
-                        0b000 => {
-                            //dbg!("gheyy");
-                            let funct12 = ubfx_32(instr, 20, 12);
-                            //println!("0b{funct12:<012b}");
-                            match funct12 {
-                                // ecall
-                                0b00000_00_00000 => {
-                                    //println!("ecall");
-                                    let cause = match self.mode {
-                                        Priv::User        => 8,
-                                        Priv::Supervisor  => 9,
-                                        Priv::Machine     => 11,
-                                    };
-
-
-                                    let num = self.x.read(17);
-                                    if num == 93 {
-                                        break;
-                                    } else if num == 0xCC {
-
-                                        let panic_log_len_ptr = Ptr(0xFFFF_F000);
-                                        let panic_log_ptr = Ptr(0xFFFF_F010);
-
-                                        let len = self.mem.read_u32(panic_log_len_ptr);
-                                        let mut msg = Vec::with_capacity(len as usize);
-
-                                        for i in 0..len {
-                                            msg.push(self.mem.read_u8(Ptr(panic_log_ptr.0 + i as u64)));
-                                        }
-
-                                        let msg = core::str::from_utf8(&msg).unwrap();
-
-                                        panic!("{msg}");
-
-
-                                    }
-
-                                    self.trap(cause, 0);
-                                    continue;
-                                }
-
-                                // ebreak
-                                0b00000_00_00001 => {
-                                    self.trap(3, self.pc);
-                                    continue;
-                                }
-
-                                // sret
-                                0b00010_00_00010 => {
-                                    self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
-                                    continue;
-                                }
-
-
-                                // mret
-                                0b00110_00_00010 => {
-                                    self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
-                                    continue;
-                                }
-
-                                // wfi
-                                0b00010_00_00101 => {
-                                    while self.csr[CSR_MIE] & self.csr[CSR_MIP] == 0 {
-                                        let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
-                                        if !cont { return false }
-                                    }
-                                }
-
-                                // sfence.vma
-                                _ if ubfx_32(instr, 25, 7) == 0b0001001 => (), 
-
-                                _ => unknown_opcode!(),
-                            }
-                        }
-
-                        _ => unknown_opcode!(),
-                    };
-
-
-                    self.x.write(rd, t);
-                }
-
-
-                // loads
-                0b0000011 => {
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let rd = ubfx_32(instr, 7, 5);
-                    let rs1 = ubfx_32(instr, 15, 5) as usize;
-                    let rs1 = self.x.read(rs1);
-                    let offset = sbfx_32(instr, 20, 12) as i32 as i64;
-
-                    let ptr = (rs1 as i64 + offset) as u64;
-                    let ptr = Ptr(ptr);
-
-                    let result = match funct3 {
-                        // lb
-                        0b000 => {
-                            let byte = self.mem.read_u8(ptr);
-                            byte as i8 as i64 as u64
-                        }
-
-                        // lh
-                        0b001 => {
-                            let byte = self.mem.read_u16(ptr);
-                            let value = byte as i16;
-
-                            value as i64 as u64
-                        }
-
-                        // lw
-                        0b010 => {
-                            let byte = self.mem.read_u32(ptr);
-                            let value = byte as i32;
-
-                            value as i64 as u64
-                        }
-
-                        // lbu
-                        0b100 => {
-                            self.mem.read_u8(ptr) as u64
-                        }
-
-                        // lhu
-                        0b101 => {
-                            self.mem.read_u16(ptr) as u64
-                        }
-
-                        // lwu
-                        0b110 => {
-                            self.mem.read_u32(ptr) as u64
-                        }
-
-
-                        // ld
-                        0b011 => {
-                            self.mem.read_u64(ptr)
-                        }
-
-                        _ => unknown_opcode!()
-                    };
-
-                    //println!("0x{:x}", result);
+                Instr::ISlt { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        ((self.x.read(rs1 as usize) as i64) < imm as i64) as u64
+                    )
+                },
+
+
+                Instr::ISltu { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        (self.x.read(rs1 as usize) < imm as i64 as u64) as u64
+                    )
+                },
+
+
+                Instr::IXor { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        self.x.read(rs1 as usize) ^ imm as i64 as u64
+                    )
+                },
+
+
+                Instr::IOr { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        self.x.read(rs1 as usize) | imm as i64 as u64
+                    )
+                },
+
+
+                Instr::IAnd { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        self.x.read(rs1 as usize) & imm as i64 as u64
+                    )
+                },
+
+
+                Instr::ISll { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        self.x.read(rs1 as usize) << ((imm & 0x3F) as u64)
+                    )
+                },
+
+
+                Instr::ISrl { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        self.x.read(rs1 as usize) >> ((imm & 0x3F) as u64)
+                    )
+
+                },
+                
+
+                Instr::ISra { rd, rs1, imm } => {
+                    self.x.write(
+                        rd as usize, 
+                        ((self.x.read(rs1 as usize) as i64) >> ((imm & 0x3F) as u32)) as u64
+                    )
+                },
+
+
+                Instr::IAddw { rd, rs1, imm } => {
+                    let lhs = self.x.read(rs1 as usize) as i32;
+                    let rhs = imm as i32;
+                    let result = lhs.wrapping_add(rhs);
+                    self.x.write(rd as usize, result as i64 as u64);
+                },
+
+
+                Instr::ISllw { rd, rs1, imm } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = (imm & 0x1F) as u32;
+                    let result = (lhs << rhs) as u32;
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::ISrlw { rd, rs1, imm } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = (imm & 0x1F) as u32;
+                    let result = lhs >> rhs;
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::ISraw { rd, rs1, imm } => {
+                    let lhs = self.x.read(rs1 as usize) as i32;
+                    let rhs = (imm & 0x1F) as u32;
+                    let result = lhs >> rhs;
+                    self.x.write(rd as usize, result as i64 as u64);
+                },
+
+
+                Instr::RAdd { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs.wrapping_add(rhs);
                     self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RSub { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs.wrapping_sub(rhs);
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RSll { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs << (rhs & 0x3F);
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RSlt { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = ((lhs as i64) < (rhs as i64)) as u64;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RSlut { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = (lhs < rhs) as u64;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RXor { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs ^ rhs;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RSrl { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs >> (rhs & 0x3F);
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RSra { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = ((lhs as i64) >> (rhs & 0x3F)) as u64;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::ROr { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs | rhs;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RAnd { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs & rhs;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RMul { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    let result = lhs.wrapping_mul(rhs);
+                    self.x.write(rd as usize, result);
+                },
+
+                
+                Instr::RMulh { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+
+                    let lhs = lhs as i64 as i128;
+                    let rhs = rhs as i64 as i128;
+
+                    let product = lhs * rhs;
+                    let result = (product >> 64) as i64 as u64;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RMulhsu { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+
+                    let lhs = lhs as i64 as i128;
+                    let rhs = rhs as u64 as u128;
+
+                    let b128 = rhs as i128;
+
+                    let product = lhs * b128;
+                    let result = (product >> 64) as u64;
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RMulhu { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+           
+                    let lhs = lhs as u128;
+                    let rhs = rhs as u128;
+
+                    let product = lhs * rhs;
+                    let result = (product >> 64) as u64;
+                    self.x.write(rd as usize, result);
+ 
+                },
+
+
+                Instr::RDiv { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as i64;
+                    let rhs = self.x.read(rs2 as usize) as i64;
+                    
+                    let result =
+                        if rhs == 0 { u64::MAX }
+                        else if lhs == i64::MIN && rhs == -1 { lhs as u64 }
+                        else { (lhs / rhs) as u64 };
+
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RDivu { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    
+                    let result =
+                        if rhs == 0 { u64::MAX }
+                        else { lhs / rhs };
+
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RRem { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as i64;
+                    let rhs = self.x.read(rs2 as usize) as i64;
+                    
+                    let result =
+                        if rhs == 0 { lhs as u64}
+                        else if lhs == i64::MIN && rhs == -1 { 0 }
+                        else { (lhs % rhs) as u64 };
+
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RRemu { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+                    
+                    let result =
+                        if rhs == 0 { lhs }
+                        else { lhs % rhs };
+
+                    self.x.write(rd as usize, result);
+                },
+
+
+                Instr::RAddw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = self.x.read(rs2 as usize) as u32;
+
+                    let result = lhs.wrapping_add(rhs);
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RSubw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = self.x.read(rs2 as usize) as u32;
+
+                    let result = lhs.wrapping_sub(rhs);
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RMulw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as i64;
+                    let rhs = self.x.read(rs2 as usize) as i64;
+
+                    let result = lhs.wrapping_mul(rhs);
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RDivw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as i32;
+                    let rhs = self.x.read(rs2 as usize) as i32;
+
+                    let result = 
+                        if rhs == 0 { -1 } 
+                        else if lhs == i32::MIN && rhs == -1 { i32::MIN } 
+                        else { lhs.wrapping_div(rhs) };
+
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RDivuw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = self.x.read(rs2 as usize) as u32;
+
+                    let result = 
+                        if rhs == 0 { u32::MAX } 
+                        else { lhs.wrapping_div(rhs) };
+
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RRemw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as i32;
+                    let rhs = self.x.read(rs2 as usize) as i32;
+
+                    let result = 
+                        if rhs == 0 { lhs } 
+                        else if lhs == i32::MIN && rhs == -1 { 0 } 
+                        else { lhs.wrapping_rem(rhs) };
+
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RRemuw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = self.x.read(rs2 as usize) as u32;
+
+                    let result = 
+                        if rhs == 0 { lhs } 
+                        else { lhs.wrapping_rem(rhs) };
+
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RSllw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = self.x.read(rs2 as usize) as u32;
+
+                    let result = lhs << (rhs & 0x1F);
+
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RSrlw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as u32;
+                    let rhs = self.x.read(rs2 as usize) as u32;
+
+                    let result = lhs >> (rhs & 0x1F);
+
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::RSraw { rd, rs1, rs2 } => {
+                    let lhs = self.x.read(rs1 as usize) as i32;
+                    let rhs = self.x.read(rs2 as usize) as u32;
+
+                    let result = lhs >> (rhs & 0x1F);
+
+                    self.x.write(rd as usize, result as i32 as i64 as u64);
+                },
+
+
+                Instr::Jal { rd, offset } => {
+                    self.x.write(rd as usize, self.pc.wrapping_add(4));
+                    self.pc = self.pc.wrapping_add(offset as i32 as i64 as u64);
+                    continue;
+                },
+
+
+                Instr::Auipc { rd, offset } => {
+                    self.x.write(rd as usize, self.pc.wrapping_add(offset as i64 as u64));
+                },
+
+
+                Instr::Lui { rd, imm } => {
+                    self.x.write(rd as usize, imm as i64 as u64);
+                },
+
+
+                Instr::CsrRw { rd, rs1, csr } => {
+                    let csr = csr as usize;
+                    let t = self.csr_read(csr);
+
+                    self.csr_write(csr, self.x.read(rs1 as usize));
+
+                    self.x.write(rd as usize, t);
+                },
+
+
+                Instr::CsrRs { rd, rs1, csr } => {
+                    let csr = csr as usize;
+                    let t = self.csr_read(csr);
+
+                    if rs1 != 0 {
+                        self.csr_write(csr, t | self.x.read(rs1 as usize));
+                    }
+
+                    self.x.write(rd as usize, t);
+                },
+
+
+                Instr::CsrRc { rd, rs1, csr } => {
+                    let csr = csr as usize;
+                    let t = self.csr_read(csr);
+
+                    if rs1 != 0 {
+                        self.csr_write(csr, t & !self.x.read(rs1 as usize));
+                    }
+
+                    self.x.write(rd as usize, t);
+                },
+
+
+                Instr::CsrRwi { rd, rs1, csr } => {
+                    let csr = csr as usize;
+                    let t = self.csr_read(csr);
+
+                    if rs1 != 0 {
+                        self.csr_write(csr, (rs1 & 0x1f) as _);
+                    }
+
+                    self.x.write(rd as usize, t);
                 }
 
 
-                // stores
-                0b0100011 => {
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let imm5 = ubfx_32(instr, 7, 5);
-                    let imm7 = ubfx_32(instr, 25, 7);
-                    let imm = (imm7 << 5) | imm5;
-                    let imm = sbfx_32(imm, 0, 12);
-                    let imm = imm as i32 as i64 as u64;
+                Instr::CsrRsi { rd, rs1, csr } => {
+                    let csr = csr as usize;
+                    let t = self.csr_read(csr);
 
-                    let rs1 = ubfx_32(instr, 15, 5) as usize;
-                    let rs2 = ubfx_32(instr, 20, 5) as usize;
+                    if rs1 != 0 {
+                        self.csr_write(csr, t | rs1 as u64);
+                    }
 
-                    let ptr = self.x.read(rs1).wrapping_add(imm);
+                    self.x.write(rd as usize, t);
+                },
+
+
+                Instr::CsrRci { rd, rs1, csr } => {
+                    let csr = csr as usize;
+                    let t = self.csr_read(csr);
+
+                    if rs1 != 0 {
+                        self.csr_write(csr, t & !(rs1 as u64));
+                    }
+
+                    self.x.write(rd as usize, t);
+                },
+
+
+                Instr::SECall { } => {
+                    //println!("ecall");
+                    let cause = match self.mode {
+                        Priv::User        => EXC_ECALL_UMODE,
+                        Priv::Supervisor  => EXC_ECALL_SMODE,
+                        Priv::Machine     => EXC_ECALL_MMODE,
+                    };
+
+
+                    let num = self.x.read(17);
+                    if num == 93 {
+                        break;
+                    } else if num == 0xCC {
+
+                        let panic_log_len_ptr = Ptr(0xFFFF_F000);
+                        let panic_log_ptr = Ptr(0xFFFF_F010);
+
+                        let len = self.mem.read_u32(panic_log_len_ptr);
+                        let mut msg = Vec::with_capacity(len as usize);
+
+                        for i in 0..len {
+                            msg.push(self.mem.read_u8(Ptr(panic_log_ptr.0 + i as u64)));
+                        }
+
+                        let msg = core::str::from_utf8(&msg).unwrap();
+
+                        panic!("{msg}");
+
+
+                    }
+
+                    self.trap(cause, 0);
+                    continue;
+                },
+
+
+                Instr::SEBreak { } => {
+                    self.trap(EXC_BREAKPOINT, self.pc);
+                    continue;
+                },
+
+
+                Instr::SSRet { } => {
+                    self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
+                    continue;
+                },
+
+
+                Instr::SMRet { } => {
+                    self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
+                    continue;
+                },
+
+
+                Instr::SWfi { } => {
+                    while self.csr_read(CSR_MIE) & self.csr_read(CSR_MIP) == 0 {
+                        let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
+                        if !cont { return false }
+                    }
+                },
+
+
+                Instr::LB { rd, rs1, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
+                    let result = self.mem.read_u8(ptr) as i8 as i64 as u64;
 
-                    match funct3 {
-                        // sb
-                        0b000 => {
-                            self.mem.write(self.mode, ptr, &[(self.x.read(rs2) & 0xFF) as u8]);
-                        }
+                    self.x.write(rd as usize, result);
+                },
 
 
-                        // sh
-                        0b001 => {
-                            self.mem.write(self.mode, ptr, &((self.x.read(rs2) & 0xFFFF) as u16).to_ne_bytes());
-                        }
+                Instr::LBu { rd, rs1, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let result = self.mem.read_u8(ptr) as u64;
+
+                    self.x.write(rd as usize, result);
+                },
 
 
-                        // sw
-                        0b010 => {
-                            self.mem.write(self.mode, ptr, &((self.x.read(rs2) & 0xFFFF_FFFF) as u32).to_ne_bytes());
-                        }
+                Instr::LH { rd, rs1, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let result = self.mem.read_u16(ptr) as i16 as i64 as u64;
+
+                    self.x.write(rd as usize, result);
+                },
 
 
-                        // sd
-                        0b011 => {
-                            self.mem.write(self.mode, ptr, &self.x.read(rs2).to_ne_bytes());
-                        }
+                Instr::LHu { rd, rs1, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let result = self.mem.read_u16(ptr) as u64;
+
+                    self.x.write(rd as usize, result);
+                },
 
 
-                        _ => unknown_opcode!(),
-                    }
-                }
+                Instr::LW { rd, rs1, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let result = self.mem.read_u32(ptr) as i32 as i64 as u64;
+
+                    self.x.write(rd as usize, result);
+                },
 
 
-                // branching
-                0b1100011 => {
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let rs1 = ubfx_32(instr, 15, 5) as usize;
-                    let rs2 = ubfx_32(instr, 20, 5) as usize;
-                    let imm =
-                        ubfx_32(instr, 7, 1) << 11
-                      | ubfx_32(instr, 8, 4) << 1
-                      | ubfx_32(instr, 25, 6) << 5
-                      | ubfx_32(instr, 31, 1) << 12; // who the fuck wrote this spec bro
-                    let imm = sbfx_64(imm as u64, 0, 13);
+                Instr::LWu { rd, rs1, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let result = self.mem.read_u32(ptr) as u64;
+
+                    self.x.write(rd as usize, result);
+                },
 
 
-                    let cond = match funct3 {
-                        // beq
-                        0b000 => {
-                            let rs1 = self.x.read(rs1);
-                            let rs2 = self.x.read(rs2);
+                Instr::LD { rd, rs1, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
 
-                            rs1 == rs2
-                        }
+                    let result = self.mem.read_u64(ptr);
 
-                        // bne
-                        0b001 => {
-                            let rs1 = self.x.read(rs1);
-                            let rs2 = self.x.read(rs2);
+                    self.x.write(rd as usize, result);
+                },
 
-                            rs1 != rs2
-                        }
+                Instr::SB { rs1, rs2, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
 
-                        // blt
-                        0b100 => {
-                            let rs1 = self.x.read(rs1) as i64;
-                            let rs2 = self.x.read(rs2) as i64;
+                    let slice = &[(self.x.read(rs2 as usize) & 0xFF) as u8];
 
-                            rs1 < rs2
-                        }
+                    self.mem.write(self.mode, ptr, slice);
+                },
 
 
-                        // bge
-                        0b101 => {
-                            let rs1 = self.x.read(rs1) as i64;
-                            let rs2 = self.x.read(rs2) as i64;
+                Instr::SH { rs1, rs2, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
 
-                            rs1 >= rs2
-                        }
+                    let slice = &((self.x.read(rs2 as usize) & 0xFFFF) as u16).to_ne_bytes();
 
-                        // bltu
-                        0b110 => {
-                            let rs1 = self.x.read(rs1);
-                            let rs2 = self.x.read(rs2);
-
-                            rs1 < rs2
-                        }
-
-                        // bgeu
-                        0b111 => {
-                            let rs1 = self.x.read(rs1);
-                            let rs2 = self.x.read(rs2);
-
-                            rs1 >= rs2
-                        }
+                    self.mem.write(self.mode, ptr, slice);
+                },
 
 
-                        _ => unknown_opcode!()
-                    };
+                Instr::SW { rs1, rs2, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let slice = &((self.x.read(rs2 as usize) & 0xFFFF_FFFF) as u32).to_ne_bytes();
+
+                    self.mem.write(self.mode, ptr, slice);
+                },
+
+
+                Instr::SD { rs1, rs2, offset } => {
+                    let ptr = (self.x.read(rs1 as usize) as i64 + offset as i64) as u64;
+                    let ptr = Ptr(ptr);
+
+                    let slice = &self.x.read(rs2 as usize).to_ne_bytes();
+
+                    self.mem.write(self.mode, ptr, slice);
+                },
+
+
+                Instr::BEq { rs1, rs2, imm } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+
+                    let cond = lhs == rhs;
 
                     if cond {
-                        self.pc = self.pc.wrapping_add(imm);
+                        self.pc = self.pc.wrapping_add(imm as u64);
                         continue;
                     }
-                }
+                },
 
 
+                Instr::BNe { rs1, rs2, imm } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
 
-                // jumps
-                0b1100111 => {
-                    let funct3 = ubfx_32(instr, 12, 3);
-                    let rs1 = ubfx_32(instr, 15, 5) as usize;
-                    let rd = ubfx_32(instr, 7, 5) as usize;
-                    let imm = sbfx_32(instr, 20, 12) as i32 as i64 as u64;
+                    let cond = lhs != rhs;
 
-
-                    match funct3 {
-                        // jalr
-                        0b000 => {
-                            let t = self.pc + 4;
-                            self.pc = self.x.read(rs1).wrapping_add(imm) & (!1);
-                            self.x.write(rd, t);
-                            continue;
-                        }
-                        _ => unknown_opcode!(),
+                    if cond {
+                        self.pc = self.pc.wrapping_add(imm as u64);
+                        continue;
                     }
-                }
+                },
 
 
-                _ => unknown_opcode!(),
+                Instr::BLt { rs1, rs2, imm } => {
+                    let lhs = self.x.read(rs1 as usize) as i64;
+                    let rhs = self.x.read(rs2 as usize) as i64;
+
+                    let cond = lhs < rhs;
+
+                    if cond {
+                        self.pc = self.pc.wrapping_add(imm as u64);
+                        continue;
+                    }
+                },
+
+
+                Instr::BLtu { rs1, rs2, imm } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+
+                    let cond = lhs < rhs;
+
+                    if cond {
+                        self.pc = self.pc.wrapping_add(imm as u64);
+                        continue;
+                    }
+                },
+
+
+                Instr::BGe { rs1, rs2, imm } => {
+                    let lhs = self.x.read(rs1 as usize) as i64;
+                    let rhs = self.x.read(rs2 as usize) as i64;
+
+                    let cond = lhs >= rhs;
+
+                    if cond {
+                        self.pc = self.pc.wrapping_add(imm as u64);
+                        continue;
+                    }
+                },
+
+
+                Instr::BGeu { rs1, rs2, imm } => {
+                    let lhs = self.x.read(rs1 as usize);
+                    let rhs = self.x.read(rs2 as usize);
+
+                    let cond = lhs >= rhs;
+
+                    if cond {
+                        self.pc = self.pc.wrapping_add(imm as u64);
+                        continue;
+                    }
+                },
+
+
+                Instr::JAlr { rd, rs1, imm } => {
+                    let t = self.pc + 4;
+                    self.pc = self.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1);
+                    self.x.write(rd as usize, t);
+                    continue;
+                },
+
+                Instr::Nop => (),
+
+                Instr::Unknown => {
+                    self.trap(EXC_ILLEGAL_INSTRUCTION, self.mem.read_u32(Ptr(self.pc)) as u64);
+                    continue;
+                },
+
+
+                Instr::NotEncoded => unreachable!(),
             }
 
+
+            // finish
             self.pc += 4;
         }
 
 
         return true;
+
+    }
+
+
+    pub fn run(&mut self, timeout_ms: u64, code: &[u8]) -> bool {
+        return self.new_run(timeout_ms, code);
     }
 
 
     fn _ret(&mut self, status: usize, epc: usize, ie_bit: u32, pie_bit: u32, pp_bit: u32, pp_len: u32) {
-        let mut mstatus = self.csr[status];
+        let mut mstatus = self.csr_read(status);
         let mpie = ubfx_64(mstatus, pie_bit, 1);
         let mpp  = ubfx_64(mstatus, pp_bit, pp_len);
 
@@ -1023,8 +1039,73 @@ impl Emulator {
         // Set MPP = User (0)
         mstatus = bfi_64(mstatus, pp_bit, pp_len, 0);
 
-        self.csr[status] = mstatus;
-        self.pc = self.csr[epc];
+        self.csr_write(status, mstatus);
+        self.pc = self.csr_read(epc);
+    }
+
+
+    pub fn csr_read(&mut self, csr: usize) -> u64 {
+        match csr {
+            CSR_SSTATUS => {
+                let mstatus = self.csr[CSR_MSTATUS];
+
+                // Map bits: SSTATUS is view of MSTATUS
+                let sie  = (mstatus >> 1) & 1;
+                let spie = (mstatus >> 5) & 1;
+                let spp  = (mstatus >> 8) & 1;
+
+                // Only keep SIE, SPIE, SPP, UXL
+                let uxl = (mstatus >> 32) & 0b11;
+
+                (sie << 1)
+                | (spie << 5)
+                | (spp << 8)
+                | (uxl << 32)
+            }
+
+            _ => self.csr[csr],
+        }
+    }
+
+
+    pub fn csr_write(&mut self, csr: usize, value: u64) {
+        match csr {
+            CSR_SSTATUS => {
+                // Updates to SSTATUS must write into MSTATUS
+                let mut mstatus = self.csr[CSR_MSTATUS];
+
+                // Mask writable fields (SIE=1, SPIE=5, SPP=8)
+                let sie  = (value >> 1) & 1;
+                let spie = (value >> 5) & 1;
+                let spp  = (value >> 8) & 1;
+
+                mstatus = (mstatus & !(1 << 1)) | (sie << 1);
+                mstatus = (mstatus & !(1 << 5)) | (spie << 5);
+                mstatus = (mstatus & !(1 << 8)) | (spp << 8);
+
+                self.csr[CSR_MSTATUS] = mstatus;
+            }
+
+            CSR_MSTATUS => {
+                // Mask off WLRL bits
+                let mask = 0
+                    | (1 << 3)  // MIE
+                    | (1 << 7)  // MPIE
+                    | (3 << 11) // MPP (2 bits)
+                    | (3 << 32); // UXL
+                self.csr[CSR_MSTATUS] = value & mask;
+            }
+
+            CSR_MTVEC => {
+                // Low 2 bits must be 0 (direct) or 1 (vectored)
+                let mode = value & 0b11;
+                let base = value & !0b11;
+                self.csr[CSR_MTVEC] = base | mode.min(1);
+            }
+
+            // Most CSRs just store the raw value
+            _ => self.csr[csr] = value,
+        }
     }
 }
 
