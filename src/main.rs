@@ -93,9 +93,9 @@ fn main() {
 
                 let bucket = buckets.get_mut(bucket).unwrap();
 
+                println!("{}: ", name);
                 let result = test_file(&options, name);
 
-                print!("{}: ", name);
                 match result {
                     TestResult::Pass(_) => {
                         bucket.pass += 1;

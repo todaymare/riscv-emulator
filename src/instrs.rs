@@ -1,8 +1,8 @@
-use std::{collections::HashMap};
+use std::{collections::HashMap, ptr::null};
 
 use crate::{mem::{Memory, Ptr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}, Emulator};
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 #[repr(u64)]
 pub enum Instr  {
     IAdd    { rd: u8, rs1: u8, imm: i16     },
@@ -94,10 +94,11 @@ pub enum Instr  {
     Nop,
     Unknown,
 
-    NotEncoded,
+    Readjust,
 }
 
 const PAGE_INSTR_SIZE : u64 = 1024;
+const ACTUAL_PAGE_INSTR_SIZE : u64 = PAGE_INSTR_SIZE + 1;
 const PAGE_BYTE_SIZE  : u64 = PAGE_INSTR_SIZE * 4;
 
 const PAGE_BITS : u32= PAGE_BYTE_SIZE.ilog2(); // log2(16KB)
@@ -106,62 +107,88 @@ const INSTR_INDEX_MASK : u64 = PAGE_INSTR_SIZE as u64 - 1;
 
 
 pub struct InstrCache {
-    current: Box<[Instr; PAGE_INSTR_SIZE as usize]>,
-    current_page: u64,
-    pages: HashMap<u64, Box<[Instr; PAGE_INSTR_SIZE as usize]>>,
+    pages: HashMap<u64, *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize]>,
+
+    page_pc: u64,
+    page_ptr: *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize],
+    code_ptr: *const Instr,
 }
 
 
 impl InstrCache {
     pub fn new() -> InstrCache {
         Self {
-            current_page: 0,
-            current: Box::new([Instr::NotEncoded; _]),
             pages: HashMap::new(),
+            page_pc: 0,
+            page_ptr: null(),
+            code_ptr: null(),
+        }
+    }
+
+
+    pub fn set_pc(&mut self, mem: &Memory, pc: u64) {
+        let page = pc >> PAGE_BITS;
+        let page_pc = pc & !PAGE_MASK;
+
+        let page_ptr =
+            if core::hint::likely(self.page_pc == page_pc) { self.page_ptr }
+            else { self.load_page(page, mem) };
+
+        self.page_pc = page_pc;
+        self.page_ptr = page_ptr;
+
+        let offset = (pc - self.page_pc) / size_of::<u32>() as u64;
+        self.code_ptr = unsafe { self.page_ptr.as_ptr().add(offset as usize) };
+    }
+
+
+    #[inline(always)]
+    pub fn pc(&self) -> u64 {
+        unsafe {
+            let instr_index = self.code_ptr.offset_from(self.page_ptr.as_ptr()) as u64;
+            self.page_pc + instr_index * size_of::<u32>() as u64
         }
     }
 
 
     #[inline(always)]
-    pub fn decode(&mut self, mem: &Memory, pc: u64) -> Instr {
-        let page = pc >> PAGE_BITS;
+    pub fn get(&self) -> Instr {
+        unsafe { *self.code_ptr }
+    }
 
-        if core::hint::likely(self.current_page == page) {
-            let index = (pc >> 2) & INSTR_INDEX_MASK;
-            unsafe { core::hint::assert_unchecked(index < PAGE_INSTR_SIZE); }
 
-            return self.current[index as usize];
-        }
-
-        self.retire_and_create(mem, pc);
-        self.decode(mem, pc)
+    #[inline(always)]
+    pub fn next(&mut self) {
+        unsafe { self.code_ptr = self.code_ptr.add(1) }
     }
 
 
     #[cold]
-    fn retire_and_create(&mut self, mem: &Memory, pc: u64) {
-        let page = pc >> PAGE_BITS;
-        println!("retiring 0x{:x} for page 0x{page:x}", self.current_page);
+    fn load_page(&mut self, page: u64, mem: &Memory) -> *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize] {
+        println!("loading page 0x{page:x}");
+        let entry = self.pages.entry(page);
 
-        let old_page = core::mem::replace(
-            &mut self.current, 
-            self.pages.remove(&page).unwrap_or_else(|| {
+        match entry {
+            std::collections::hash_map::Entry::Occupied(occupied_entry) => *occupied_entry.get(),
+            std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                println!("not loaded");
 
                 let base_ptr = page << PAGE_BITS;
-                Box::new(core::array::from_fn(|i| {
+                let ptr = Box::leak(Box::new(core::array::from_fn(|i| {
+                    if i+1 == ACTUAL_PAGE_INSTR_SIZE as usize {
+                        return Instr::Readjust;
+                    }
+
                     let ptr = base_ptr + i as u64 * 4;
                     let ptr = Ptr(ptr);
                     let instr = mem.read_u32(ptr);
 
                     Instr::decode(instr)
-                }))
+                })));
 
-            }),
-        );
-
-        self.pages.insert(self.current_page, old_page);
-
-        self.current_page = page;
+                *vacant_entry.insert(ptr)
+            },
+        }
     }
 }
 

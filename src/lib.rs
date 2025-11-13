@@ -1,9 +1,11 @@
 #![feature(likely_unlikely)]
+#![feature(array_ptr_get)]
+#![feature(cold_path)]
 pub mod mem;
 pub mod utils;
 pub mod instrs;
 
-use std::{ops::Rem, process::exit, sync::Arc, thread::sleep_ms, time::Instant};
+use std::{hint::cold_path, ops::Rem, process::exit, ptr::null, sync::Arc, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
 
@@ -15,9 +17,12 @@ pub struct Emulator {
     cache: InstrCache,
     mode: Priv,
     pub x  : Regs,
-    pc : u64,
+
     csr: [u64; 4096],
 }
+
+
+unsafe impl Send for Emulator {}
 
 
 #[derive(Debug, Clone, Copy)]
@@ -105,11 +110,9 @@ impl Emulator {
         Self {
             mem: Arc::new(Memory::new()),
             x: Regs::new(),
-            pc: 0,
             csr: [0; _],
             mode: Priv::Machine,
             cache: InstrCache::new(),
-            
         }
     }
 
@@ -162,7 +165,7 @@ impl Emulator {
         status = bfi_64(status, pp_bit, pp_len, self.mode as u64);
 
         self.csr_write(status_csr, status);
-        self.csr_write(epc_csr, self.pc);
+        self.csr_write(epc_csr, self.cache.pc());
         self.csr_write(cause_csr, mcause);
         self.csr_write(tval_csr, tval);
 
@@ -174,11 +177,14 @@ impl Emulator {
         let base = tvec & !0b11;
         let tmode = tvec & 0b11;
 
-        if tmode == 1 && interrupt != 0 {
-            self.pc = base + 4 * code5;
-        } else {
-            self.pc = base;
-        }
+        let pc = 
+            if tmode == 1 && interrupt != 0 {
+                base + 4 * code5
+            } else {
+                base
+            };
+
+        self.cache.set_pc(&self.mem, pc);
     }
 
 
@@ -219,10 +225,11 @@ impl Emulator {
         let mut last_ns = 0;
 
         self.x.write(2, 0xB000_0000);
-        self.pc = 0x8000_0000;
-        self.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
 
-        self.mem.write(self.mode, Ptr(self.pc), code);
+        self.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
+        self.mem.write(self.mode, Ptr(0x8000_0000), code);
+
+        self.cache.set_pc(&self.mem, 0x8000_0000);
 
         loop {
             let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
@@ -248,16 +255,13 @@ impl Emulator {
 
 
             // decode
-            if (self.pc & 0b11) != 0 {
-                self.trap(EXC_INSTR_ADDR_MISALIGNED, self.pc);
-                continue;
-            }
-
-            let instr = self.cache.decode(&self.mem, self.pc);
+            let instr = self.cache.get();
+            //println!("pc: 0x{:x}, instr: {instr:?}", self.cache.pc());
 
             // execute
             match instr {
                 Instr::IAdd { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         self.x.read(rs1 as usize).wrapping_add(imm as i64 as u64)
@@ -266,6 +270,7 @@ impl Emulator {
 
 
                 Instr::ISlt { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         ((self.x.read(rs1 as usize) as i64) < imm as i64) as u64
@@ -274,6 +279,7 @@ impl Emulator {
 
 
                 Instr::ISltu { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         (self.x.read(rs1 as usize) < imm as i64 as u64) as u64
@@ -282,6 +288,7 @@ impl Emulator {
 
 
                 Instr::IXor { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         self.x.read(rs1 as usize) ^ imm as i64 as u64
@@ -290,6 +297,7 @@ impl Emulator {
 
 
                 Instr::IOr { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         self.x.read(rs1 as usize) | imm as i64 as u64
@@ -298,6 +306,7 @@ impl Emulator {
 
 
                 Instr::IAnd { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         self.x.read(rs1 as usize) & imm as i64 as u64
@@ -306,6 +315,7 @@ impl Emulator {
 
 
                 Instr::ISll { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         self.x.read(rs1 as usize) << ((imm & 0x3F) as u64)
@@ -314,6 +324,7 @@ impl Emulator {
 
 
                 Instr::ISrl { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         self.x.read(rs1 as usize) >> ((imm & 0x3F) as u64)
@@ -323,6 +334,7 @@ impl Emulator {
                 
 
                 Instr::ISra { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     self.x.write(
                         rd as usize, 
                         ((self.x.read(rs1 as usize) as i64) >> ((imm & 0x3F) as u32)) as u64
@@ -331,6 +343,7 @@ impl Emulator {
 
 
                 Instr::IAddw { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i32;
                     let rhs = imm as i32;
                     let result = lhs.wrapping_add(rhs);
@@ -339,6 +352,7 @@ impl Emulator {
 
 
                 Instr::ISllw { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = (imm & 0x1F) as u32;
                     let result = (lhs << rhs) as u32;
@@ -347,6 +361,7 @@ impl Emulator {
 
 
                 Instr::ISrlw { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = (imm & 0x1F) as u32;
                     let result = lhs >> rhs;
@@ -355,6 +370,7 @@ impl Emulator {
 
 
                 Instr::ISraw { rd, rs1, imm } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i32;
                     let rhs = (imm & 0x1F) as u32;
                     let result = lhs >> rhs;
@@ -363,6 +379,7 @@ impl Emulator {
 
 
                 Instr::RAdd { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs.wrapping_add(rhs);
@@ -371,6 +388,7 @@ impl Emulator {
 
 
                 Instr::RSub { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs.wrapping_sub(rhs);
@@ -379,6 +397,7 @@ impl Emulator {
 
 
                 Instr::RSll { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs << (rhs & 0x3F);
@@ -387,6 +406,7 @@ impl Emulator {
 
 
                 Instr::RSlt { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = ((lhs as i64) < (rhs as i64)) as u64;
@@ -395,6 +415,7 @@ impl Emulator {
 
 
                 Instr::RSlut { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = (lhs < rhs) as u64;
@@ -403,6 +424,7 @@ impl Emulator {
 
 
                 Instr::RXor { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs ^ rhs;
@@ -411,6 +433,7 @@ impl Emulator {
 
 
                 Instr::RSrl { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs >> (rhs & 0x3F);
@@ -419,6 +442,7 @@ impl Emulator {
 
 
                 Instr::RSra { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = ((lhs as i64) >> (rhs & 0x3F)) as u64;
@@ -427,6 +451,7 @@ impl Emulator {
 
 
                 Instr::ROr { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs | rhs;
@@ -435,6 +460,7 @@ impl Emulator {
 
 
                 Instr::RAnd { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs & rhs;
@@ -443,6 +469,7 @@ impl Emulator {
 
 
                 Instr::RMul { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     let result = lhs.wrapping_mul(rhs);
@@ -451,6 +478,7 @@ impl Emulator {
 
                 
                 Instr::RMulh { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
 
@@ -464,6 +492,7 @@ impl Emulator {
 
 
                 Instr::RMulhsu { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
 
@@ -479,6 +508,7 @@ impl Emulator {
 
 
                 Instr::RMulhu { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
            
@@ -493,6 +523,7 @@ impl Emulator {
 
 
                 Instr::RDiv { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i64;
                     let rhs = self.x.read(rs2 as usize) as i64;
                     
@@ -506,6 +537,7 @@ impl Emulator {
 
 
                 Instr::RDivu { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     
@@ -518,6 +550,7 @@ impl Emulator {
 
 
                 Instr::RRem { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i64;
                     let rhs = self.x.read(rs2 as usize) as i64;
                     
@@ -531,6 +564,7 @@ impl Emulator {
 
 
                 Instr::RRemu { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize);
                     let rhs = self.x.read(rs2 as usize);
                     
@@ -543,6 +577,7 @@ impl Emulator {
 
 
                 Instr::RAddw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = self.x.read(rs2 as usize) as u32;
 
@@ -552,6 +587,7 @@ impl Emulator {
 
 
                 Instr::RSubw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = self.x.read(rs2 as usize) as u32;
 
@@ -561,6 +597,7 @@ impl Emulator {
 
 
                 Instr::RMulw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i64;
                     let rhs = self.x.read(rs2 as usize) as i64;
 
@@ -570,6 +607,7 @@ impl Emulator {
 
 
                 Instr::RDivw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i32;
                     let rhs = self.x.read(rs2 as usize) as i32;
 
@@ -583,6 +621,7 @@ impl Emulator {
 
 
                 Instr::RDivuw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = self.x.read(rs2 as usize) as u32;
 
@@ -595,6 +634,7 @@ impl Emulator {
 
 
                 Instr::RRemw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i32;
                     let rhs = self.x.read(rs2 as usize) as i32;
 
@@ -608,6 +648,7 @@ impl Emulator {
 
 
                 Instr::RRemuw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = self.x.read(rs2 as usize) as u32;
 
@@ -620,6 +661,7 @@ impl Emulator {
 
 
                 Instr::RSllw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = self.x.read(rs2 as usize) as u32;
 
@@ -630,6 +672,7 @@ impl Emulator {
 
 
                 Instr::RSrlw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as u32;
                     let rhs = self.x.read(rs2 as usize) as u32;
 
@@ -640,6 +683,7 @@ impl Emulator {
 
 
                 Instr::RSraw { rd, rs1, rs2 } => {
+                    core::hint::likely(true);
                     let lhs = self.x.read(rs1 as usize) as i32;
                     let rhs = self.x.read(rs2 as usize) as u32;
 
@@ -650,14 +694,15 @@ impl Emulator {
 
 
                 Instr::Jal { rd, offset } => {
-                    self.x.write(rd as usize, self.pc.wrapping_add(4));
-                    self.pc = self.pc.wrapping_add(offset as i32 as i64 as u64);
+                    let pc = self.cache.pc();
+                    self.x.write(rd as usize, pc.wrapping_add(4));
+                    self.cache.set_pc(&self.mem, pc.wrapping_add(offset as i32 as i64 as u64));
                     continue;
                 },
 
 
                 Instr::Auipc { rd, offset } => {
-                    self.x.write(rd as usize, self.pc.wrapping_add(offset as i64 as u64));
+                    self.x.write(rd as usize, self.cache.pc().wrapping_add(offset as i64 as u64));
                 },
 
 
@@ -667,6 +712,7 @@ impl Emulator {
 
 
                 Instr::CsrRw { rd, rs1, csr } => {
+                    core::hint::cold_path();
                     let csr = csr as usize;
                     let t = self.csr_read(csr);
 
@@ -677,6 +723,7 @@ impl Emulator {
 
 
                 Instr::CsrRs { rd, rs1, csr } => {
+                    core::hint::cold_path();
                     let csr = csr as usize;
                     let t = self.csr_read(csr);
 
@@ -689,6 +736,7 @@ impl Emulator {
 
 
                 Instr::CsrRc { rd, rs1, csr } => {
+                    core::hint::cold_path();
                     let csr = csr as usize;
                     let t = self.csr_read(csr);
 
@@ -701,6 +749,7 @@ impl Emulator {
 
 
                 Instr::CsrRwi { rd, rs1, csr } => {
+                    core::hint::cold_path();
                     let csr = csr as usize;
                     let t = self.csr_read(csr);
 
@@ -713,6 +762,7 @@ impl Emulator {
 
 
                 Instr::CsrRsi { rd, rs1, csr } => {
+                    core::hint::cold_path();
                     let csr = csr as usize;
                     let t = self.csr_read(csr);
 
@@ -725,6 +775,7 @@ impl Emulator {
 
 
                 Instr::CsrRci { rd, rs1, csr } => {
+                    core::hint::cold_path();
                     let csr = csr as usize;
                     let t = self.csr_read(csr);
 
@@ -737,6 +788,7 @@ impl Emulator {
 
 
                 Instr::SECall { } => {
+                    core::hint::cold_path();
                     //println!("ecall");
                     let cause = match self.mode {
                         Priv::User        => EXC_ECALL_UMODE,
@@ -773,24 +825,28 @@ impl Emulator {
 
 
                 Instr::SEBreak { } => {
-                    self.trap(EXC_BREAKPOINT, self.pc);
+                    core::hint::cold_path();
+                    self.trap(EXC_BREAKPOINT, self.cache.pc());
                     continue;
                 },
 
 
                 Instr::SSRet { } => {
+                    core::hint::cold_path();
                     self._ret(CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
                     continue;
                 },
 
 
                 Instr::SMRet { } => {
+                    core::hint::cold_path();
                     self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
                     continue;
                 },
 
 
                 Instr::SWfi { } => {
+                    core::hint::cold_path();
                     while self.csr_read(CSR_MIE) & self.csr_read(CSR_MIP) == 0 {
                         let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
                         if !cont { return false }
@@ -914,7 +970,8 @@ impl Emulator {
                     let cond = lhs == rhs;
 
                     if cond {
-                        self.pc = self.pc.wrapping_add(imm as u64);
+                        let pc = self.cache.pc();
+                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -927,7 +984,8 @@ impl Emulator {
                     let cond = lhs != rhs;
 
                     if cond {
-                        self.pc = self.pc.wrapping_add(imm as u64);
+                        let pc = self.cache.pc();
+                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -940,7 +998,8 @@ impl Emulator {
                     let cond = lhs < rhs;
 
                     if cond {
-                        self.pc = self.pc.wrapping_add(imm as u64);
+                        let pc = self.cache.pc();
+                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -953,7 +1012,8 @@ impl Emulator {
                     let cond = lhs < rhs;
 
                     if cond {
-                        self.pc = self.pc.wrapping_add(imm as u64);
+                        let pc = self.cache.pc();
+                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -966,7 +1026,8 @@ impl Emulator {
                     let cond = lhs >= rhs;
 
                     if cond {
-                        self.pc = self.pc.wrapping_add(imm as u64);
+                        let pc = self.cache.pc();
+                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -979,15 +1040,17 @@ impl Emulator {
                     let cond = lhs >= rhs;
 
                     if cond {
-                        self.pc = self.pc.wrapping_add(imm as u64);
+                        let pc = self.cache.pc();
+                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
 
 
                 Instr::JAlr { rd, rs1, imm } => {
-                    let t = self.pc + 4;
-                    self.pc = self.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1);
+                    let pc = self.cache.pc();
+                    let t = pc + 4;
+                    self.cache.set_pc(&self.mem, self.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1));
                     self.x.write(rd as usize, t);
                     continue;
                 },
@@ -995,17 +1058,23 @@ impl Emulator {
                 Instr::Nop => (),
 
                 Instr::Unknown => {
-                    self.trap(EXC_ILLEGAL_INSTRUCTION, self.mem.read_u32(Ptr(self.pc)) as u64);
+                    core::hint::cold_path();
+                    self.trap(EXC_ILLEGAL_INSTRUCTION, self.mem.read_u32(Ptr(self.cache.pc())) as u64);
                     continue;
                 },
 
 
-                Instr::NotEncoded => unreachable!(),
+                Instr::Readjust => {
+                    core::hint::cold_path();
+                    let pc = self.cache.pc();
+                    self.cache.set_pc(&self.mem, pc);
+                    continue;
+                },
             }
 
 
             // finish
-            self.pc += 4;
+            self.cache.next();
         }
 
 
@@ -1040,7 +1109,8 @@ impl Emulator {
         mstatus = bfi_64(mstatus, pp_bit, pp_len, 0);
 
         self.csr_write(status, mstatus);
-        self.pc = self.csr_read(epc);
+        let epc = self.csr_read(epc);
+        self.cache.set_pc(&self.mem, epc);
     }
 
 
