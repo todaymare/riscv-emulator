@@ -1,14 +1,14 @@
 pub mod mem;
 pub mod utils;
 
-use std::{ops::Rem, process::exit, thread::sleep_ms, time::Instant};
+use std::{ops::Rem, process::exit, sync::Arc, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
 
 use crate::{mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
 pub struct Emulator {
-    mem: Memory,
+    pub mem: Arc<Memory>,
 
     mode: Priv,
     pub x  : Regs,
@@ -73,7 +73,7 @@ const INTERRUPTS: [u64; 3] = [
 impl Emulator {
     pub fn new() -> Self {
         Self {
-            mem: Memory::new(),
+            mem: Arc::new(Memory::new()),
             x: Regs::new(),
             pc: 0,
             csr: [0; _],
@@ -175,7 +175,7 @@ impl Emulator {
     }
 
 
-    pub fn run(&mut self, code: &[u8]) -> bool {
+    pub fn run(&mut self, timeout_ms: u64, code: &[u8]) -> bool {
         let start = Instant::now();
         let mut last_ns = 0;
 
@@ -187,6 +187,9 @@ impl Emulator {
 
         loop {
             self.tick_timer(&start, &mut last_ns);
+
+
+            if start.elapsed().as_millis() as u64 >= timeout_ms { return false }
 
 
             // check interrupts
@@ -373,6 +376,107 @@ impl Emulator {
                         // and
                         0b0000000_111 => rs1 & rs2,
 
+                        // mul
+                        0b0000001_000 => rs1.wrapping_mul(rs2),
+
+
+                        // mulh
+                        0b0000001_001 => {
+                            let a = rs1 as i64 as i128;
+                            let b = rs2 as i64 as i128;
+                            let product = a * b;
+                            let high = (product >> 64) as i64 as u64;
+                            high
+                        }
+
+
+                        // mulhsu
+                        0b0000001_010 => {
+                            let a = rs1 as i64 as i128;
+                            let b = rs2 as u64 as u128;
+
+                            let b128 = b as i128;
+
+                            let product = a * b128;
+                            let high = (product >> 64) as u64;
+                            high
+                        }
+
+
+                        // mulhu
+                        0b0000001_011 => {
+                            let a = rs1 as u128;
+                            let b = rs2 as u128;
+
+                            let product = a * b;
+                            let high = (product >> 64) as u64;
+                            high
+                        }
+
+
+                        // div
+                        0b0000001_100 => {
+                            let a = rs1 as i64;
+                            let b = rs2 as i64;
+
+                            let result = if b == 0 {
+                                // division by zero = all 1s
+                                u64::MAX
+                            } else if a == i64::MIN && b == -1 {
+                                // signed overflow = dividend unchanged
+                                a as u64
+                            } else {
+                                (a / b) as u64
+                            };
+
+                            result
+                        }
+
+
+                        // divu
+                        0b0000001_101 => {
+                            let result = if rs2 == 0 {
+                                // division by zero = all 1s
+                                u64::MAX
+                            } else {
+                                (rs1 / rs2) as u64
+                            };
+
+                            result
+                        }
+
+
+                        // rem
+                        0b0000001_110 => {
+                            let a = rs1 as i64;
+                            let b = rs2 as i64;
+
+                            let result = if b == 0 {
+                                a as u64
+                            } else if a == i64::MIN && b == -1 {
+                                0   // overflow remainder is 0
+                            } else {
+                                (a % b) as u64
+                            };
+
+                            result
+                        }
+
+
+                        // remu
+                        0b0000001_111 => {
+                            let a = rs1;
+                            let b = rs2;
+
+                            let result = if b == 0 {
+                                a   // remainder = dividend
+                            } else {
+                                a % b
+                            };
+
+                            result
+                        }
+
                         _ => unknown_opcode!(),
                     };
 
@@ -384,6 +488,7 @@ impl Emulator {
                 0b0111011 => {
                     let funct7 = ubfx_32(instr, 25, 7);
                     let funct3 = ubfx_32(instr, 12, 3);
+                    let funct10 = funct7 << 3 | funct3;
 
                     let rs1    = ubfx_32(instr, 15, 5) as usize;
                     let rs2    = ubfx_32(instr, 20, 5) as usize;
@@ -391,34 +496,101 @@ impl Emulator {
                     let rs2    = self.x.read(rs2);
                     let rd     = ubfx_32(instr,  7, 5) as usize;
 
-                    let result = match funct3 {
+
+                    let result = match funct10 {
                         // addw
-                        0b000 if funct7 == 0b0000_000 => {
+                        0b0000000_000 => {
                             let result = (rs1 as u32).wrapping_add(rs2 as u32);
                             result
                         }
 
                         // subw
-                        0b000 if funct7 == 0b0100_000 => {
+                        0b0100000_000 => {
                             let result = (rs1 as u32).wrapping_sub(rs2 as u32);
                             result
                         }
 
 
+                        // mulw
+                        0b0000001_000 => {
+                            let a = rs1 as i32 as i64;
+                            let b = rs2 as i32 as i64;
+
+                            let result = (a.wrapping_mul(b)) as i32;
+                            result as u32
+                        }
+
+
+                        // divw 
+                        0b0000001_100 => {
+                            let a = rs1 as i32;
+                            let b = rs2 as i32;
+
+                            let result = if b == 0 {
+                                -1
+                            } else if a == i32::MIN && b == -1 {
+                                i32::MIN
+                            } else {
+                                a.wrapping_div(b)
+                            };
+
+                            result as u32
+                        }
+
+
+                        // divuw 
+                        0b0000001_101 => {
+                            if rs2 == 0 {
+                                u32::MAX
+                            } else {
+                                rs1 as u32 / rs2 as u32
+                            }
+                        }
+
+
+                        // remw
+                        0b0000001_110 => {
+                            let a = rs1 as i32;
+                            let b = rs2 as i32;
+
+                            let result = if b == 0 {
+                                a
+                            } else if a == i32::MIN && b == -1 {
+                                0
+                            } else {
+                                a.wrapping_rem(b)
+                            };
+
+                            result as u32
+                        }
+
+
+                        // remuw 
+                        0b0000001_111 => {
+                            if rs2 == 0 {
+                                rs1 as u32
+                            } else {
+                                rs1 as u32 % rs2 as u32
+                            }
+                        }
+
+
+
+
                         // sllw
-                        0b001 => {
+                        0b0000000_001 => {
                             let shamt = rs2 & 0x1F;
                             (rs1 << shamt) as u32
                         }
 
                         // srlw
-                        0b101 if funct7 == 0b00000_00  => {
+                        0b0000000_101 => {
                             let shamt = rs2 & 0x1F;
                             rs1 as u32 >> shamt
                         }
 
                         // sraw
-                        0b101 if funct7 == 0b01000_00 => {
+                        0b0100000_101 => {
                             let shamt = rs2 & 0x1F;
                             (rs1 as i32 >> shamt) as u32
                         }
@@ -553,8 +725,13 @@ impl Emulator {
                                         let panic_log_ptr = Ptr(0xFFFF_F010);
 
                                         let len = self.mem.read_u32(panic_log_len_ptr);
-                                        let slice = self.mem.read(panic_log_ptr, len as usize);
-                                        let msg = core::str::from_utf8(slice).unwrap();
+                                        let mut msg = Vec::with_capacity(len as usize);
+
+                                        for i in 0..len {
+                                            msg.push(self.mem.read_u8(Ptr(panic_log_ptr.0 + i as u64)));
+                                        }
+
+                                        let msg = core::str::from_utf8(&msg).unwrap();
 
                                         panic!("{msg}");
 
@@ -587,6 +764,7 @@ impl Emulator {
                                 // wfi
                                 0b00010_00_00101 => {
                                     while self.csr[CSR_MIE] & self.csr[CSR_MIP] == 0 {
+                                        if start.elapsed().as_millis() as u64 >= timeout_ms { return false }
                                         self.tick_timer(&start, &mut last_ns);
                                     }
                                 }
@@ -620,56 +798,45 @@ impl Emulator {
                     let result = match funct3 {
                         // lb
                         0b000 => {
-                            let byte = self.mem.read(ptr, 1)[0];
+                            let byte = self.mem.read_u8(ptr);
                             byte as i8 as i64 as u64
                         }
 
                         // lh
                         0b001 => {
-                            let byte = self.mem.read(ptr, 2);
-                            let value = i16::from_ne_bytes(byte.try_into().unwrap());
+                            let byte = self.mem.read_u16(ptr);
+                            let value = byte as i16;
 
                             value as i64 as u64
                         }
 
                         // lw
                         0b010 => {
-                            let byte = self.mem.read(ptr, 4);
-                            let value = i32::from_ne_bytes(byte.try_into().unwrap());
+                            let byte = self.mem.read_u32(ptr);
+                            let value = byte as i32;
 
                             value as i64 as u64
                         }
 
                         // lbu
                         0b100 => {
-                            let byte = self.mem.read(ptr, 1)[0];
-
-                            byte as u64
+                            self.mem.read_u8(ptr) as u64
                         }
 
                         // lhu
                         0b101 => {
-                            let byte = self.mem.read(ptr, 2);
-                            let value = u16::from_ne_bytes(byte.try_into().unwrap());
-
-                            value as u64
+                            self.mem.read_u16(ptr) as u64
                         }
 
                         // lwu
                         0b110 => {
-                            let byte = self.mem.read(ptr, 4);
-                            let value = u32::from_ne_bytes(byte.try_into().unwrap());
-
-                            value as u64
+                            self.mem.read_u32(ptr) as u64
                         }
 
 
                         // ld
                         0b011 => {
-                            let byte = self.mem.read(ptr, 8);
-                            let value = u64::from_ne_bytes(byte.try_into().unwrap());
-
-                            value
+                            self.mem.read_u64(ptr)
                         }
 
                         _ => unknown_opcode!()

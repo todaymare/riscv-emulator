@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 colourful = { git = "https://github.com/todaymare/colourful" }
+winit = "*"
+pixels = "*"

@@ -1,4 +1,4 @@
-use std::{any::Any, collections::HashMap, env, ffi::OsStr, option, panic, sync::{Arc, Mutex}, thread::JoinHandle, time::Instant};
+use std::{any::Any, collections::HashMap, env, ffi::OsStr, option, panic, sync::{Arc, Mutex}, thread::JoinHandle};
 
 use colourful::{Colour, ColourBrush};
 use pixels::{Pixels, SurfaceTexture};
@@ -228,11 +228,9 @@ enum TestResult {
 
 
 fn test_file(opts: &Options, path: &str) -> TestResult {
-    let now = Instant::now();
     let file = std::fs::read(path).unwrap();
 
     let em = Emulator::new();
-    let mem = em.mem.clone();
 
     let em = Arc::new(Mutex::new(em));
 
@@ -241,6 +239,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
     let result = std::thread::spawn(move || 
         panic::catch_unwind(move || {
             let result = em_thread.lock().unwrap().run(timeout, &file);
+            println!("hey??");
             result
         })
     );
@@ -252,7 +251,6 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
         let mut app = App {
             data: None,
             cpu: &result,
-            mem: &mem,
         };
 
 
@@ -272,7 +270,6 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
 
         return TestResult::Crashed("unknown panic type".to_string())
     }
-
 
 
     let Ok(em) = Arc::into_inner(em).unwrap().into_inner()
@@ -298,7 +295,6 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
 struct App<'a> {
     data: Option<AppInner>,
     cpu: &'a JoinHandle<Result<bool, Box<dyn Any + Send + 'static>>>,
-    mem: &'a Memory,
 }
 
 
@@ -310,8 +306,8 @@ struct AppInner {
 
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let width = 1920/3;
-        let height = 1080/3;
+        let width = 1920;
+        let height = 1080;
 
         let attr = WindowAttributes::default()
             .with_title("sesame")
@@ -327,14 +323,10 @@ impl ApplicationHandler for App<'_> {
         let st = SurfaceTexture::new(width, height, window);
         let pixels = Pixels::new(width, height, st).unwrap();
 
-        window.request_redraw();
-
         self.data = Some(AppInner {
             window,
             pixels,
         });
-
-        
     }
 
     fn window_event(
@@ -347,12 +339,7 @@ impl ApplicationHandler for App<'_> {
             winit::event::WindowEvent::RedrawRequested => {
                 let data = self.data.as_mut().unwrap();
 
-                let buf = data.pixels.frame_mut();
-                let ptr = Ptr(0x1000_0000);
-
-                for i in 0..buf.len() {
-                    buf[i] = self.mem.read_u8(Ptr(ptr.0 + i as u64));
-                }
+                println!("frame");
 
                 data.pixels.render().unwrap();
 
