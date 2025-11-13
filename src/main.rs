@@ -228,7 +228,7 @@ enum TestResult {
 
 
 fn test_file(opts: &Options, path: &str) -> TestResult {
-    let now = Instant::now();
+    let mut now = Instant::now();
     let file = std::fs::read(path).unwrap();
 
     let em = Emulator::new();
@@ -262,6 +262,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
 
 
     let result = result.join().unwrap();
+    println!("took {:?}", now.elapsed());
 
     if let Err(e) = result {
         if let Some(msg) = e.downcast_ref::<&str>() {
@@ -310,8 +311,8 @@ struct AppInner {
 
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let width = 1920/3;
-        let height = 1080/3;
+        let width = 1920;
+        let height = 1080;
 
         let attr = WindowAttributes::default()
             .with_title("sesame")
@@ -325,7 +326,7 @@ impl ApplicationHandler for App<'_> {
 
 
         let st = SurfaceTexture::new(width, height, window);
-        let pixels = Pixels::new(width, height, st).unwrap();
+        let pixels = Pixels::new(width/3, height/3, st).unwrap();
 
         window.request_redraw();
 
@@ -348,6 +349,7 @@ impl ApplicationHandler for App<'_> {
                 let data = self.data.as_mut().unwrap();
 
                 let buf = data.pixels.frame_mut();
+                dbg!(buf.len());
                 let ptr = Ptr(0x1000_0000);
 
                 for i in 0..buf.len() {
