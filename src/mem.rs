@@ -121,7 +121,6 @@ impl Memory {
 
                 unsafe {
 
-
                 let ptr = self.buff.0.add(ptr.0 as usize);
                 for i in 0..data.len() {
                     (&*ptr.add(i)).store(data[i], std::sync::atomic::Ordering::Relaxed);
@@ -148,4 +147,5 @@ impl Region {
 }
 
 
+#[derive(Clone, Copy)]
 pub struct Ptr(pub u64);

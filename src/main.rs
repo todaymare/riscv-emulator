@@ -348,9 +348,25 @@ impl ApplicationHandler for App<'_> {
             winit::event::WindowEvent::RedrawRequested => {
                 let data = self.data.as_mut().unwrap();
 
+                let settings = Ptr(0x1000_0000);
+                loop {
+                    let is_frame_ready = self.mem.read_u8(settings);
+                    if is_frame_ready == 1 {
+                        self.mem.write(riscv_emulator::Priv::Machine, settings, &[0]);
+                        break;
+                    }
+
+
+                    if self.cpu.is_finished() {
+                        event_loop.exit();
+                        return;
+                    }
+
+
+                }
+
                 let buf = data.pixels.frame_mut();
-                dbg!(buf.len());
-                let ptr = Ptr(0x1000_0000);
+                let ptr = Ptr(0x1000_00FF);
 
                 for i in 0..buf.len() {
                     buf[i] = self.mem.read_u8(Ptr(ptr.0 + i as u64));
