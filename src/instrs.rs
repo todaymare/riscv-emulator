@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ptr::null};
+use std::{collections::HashMap, hint::unreachable_unchecked, ptr::null};
 
 use crate::{mem::{Memory, Ptr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}, Emulator};
 
@@ -96,6 +96,7 @@ pub enum Instr  {
 
     Readjust,
 }
+
 
 const PAGE_INSTR_SIZE : u64 = 1024;
 const ACTUAL_PAGE_INSTR_SIZE : u64 = PAGE_INSTR_SIZE + 1;
@@ -526,6 +527,41 @@ impl Instr {
             }
 
             _ => Instr::Unknown,
+        }
+    }
+
+
+
+    fn handler(self) -> unsafe fn(&mut Emulator, Instr) {
+        match self {
+            Self::IAdd { .. } => {
+                |em, i| unsafe {
+                    let Self::IAdd { rd, rs1, imm } = i
+                    else { unreachable_unchecked() };
+
+                    em.x.write(
+                        rd as usize, 
+                        em.x.read(rs1 as usize).wrapping_add(imm as i64 as u64)
+                    );
+
+                    em.cache.next();
+                }
+            }
+
+            Self::IOr { .. } => {
+                |em, i| unsafe {
+                    let Self::IOr { rd, rs1, imm } = i
+                    else { unreachable_unchecked() };
+
+                    em.x.write(
+                        rd as usize, 
+                        em.x.read(rs1 as usize).wrapping_add(imm as i64 as u64)
+                    );
+
+                    em.cache.next();
+                }
+            }
+            _ => todo!(),
         }
     }
 }

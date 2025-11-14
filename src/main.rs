@@ -240,7 +240,11 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
     let timeout = opts.timeout;
     let result = std::thread::spawn(move || 
         panic::catch_unwind(move || {
+            let time = Instant::now();
             let result = em_thread.lock().unwrap().run(timeout, &file);
+            let time = time.elapsed();
+            let cycles = em_thread.lock().unwrap().csr_read(0xC00);
+            println!("{cycles} cycles in {time:?}");
             result
         })
     );

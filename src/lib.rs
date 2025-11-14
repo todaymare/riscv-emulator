@@ -5,7 +5,7 @@ pub mod mem;
 pub mod utils;
 pub mod instrs;
 
-use std::{hint::cold_path, ops::Rem, process::exit, ptr::null, sync::Arc, thread::sleep_ms, time::Instant};
+use std::{hint::cold_path, mem::discriminant, ops::Rem, process::exit, ptr::null, sync::Arc, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
 
@@ -192,7 +192,7 @@ impl Emulator {
         let cycle = self.csr_read(CSR_CYCLE) + 1;
         self.csr_write(CSR_CYCLE, cycle);
 
-        if cycle % 10000 != 0 { return true }
+        if cycle % 1000 != 0 { return true }
         let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
 
         const MTIME_TICK_NS: u128 = 100; // 10MHz
