@@ -1,6 +1,7 @@
 #![feature(likely_unlikely)]
 #![feature(array_ptr_get)]
 #![feature(cold_path)]
+#![forbid(unused_must_use)]
 pub mod mem;
 pub mod utils;
 pub mod instrs;
@@ -9,7 +10,7 @@ use std::{hint::cold_path, mem::discriminant, ops::Rem, process::exit, ptr::null
 
 use colourful::ColourBrush;
 
-use crate::{instrs::{Instr, InstrCache}, mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
+use crate::{instrs::{CodePtr, Instr, InstrCache}, mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
 pub struct Emulator {
     pub local: Mutex<Local>,
@@ -161,14 +162,18 @@ impl Emulator {
         shared.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
         shared.mem.write(local.mode, Ptr(0x8000_0000), code);
 
-        local.set_pc(shared, 0x8000_0000);
+        let mut code = local.cache.set_pc(&shared.mem, 0x8000_0000);
 
         loop {
-            let cont = local.tick(shared);
+            let (new_code, cont) = local.tick(shared, code);
             if !cont { return false }
 
+            if let Some(new_code) = new_code {
+                code = new_code;
+            }
+
             // decode
-            let instr = local.cache.get();
+            let instr = code.get();
             //println!("pc: 0x{:x}, instr: {instr:?}", exec.cache.pc());
 
             // execute
@@ -607,17 +612,20 @@ impl Emulator {
 
 
                 Instr::Jal { rd, offset } => {
-                    let pc = local.cache.pc();
-                    let success = local.set_pc(shared, pc.wrapping_add(offset as i32 as i64 as u64));
+                    let pc = local.cache.pc(code);
+                    let (new_cptr, success) = local.set_pc(shared, code, pc.wrapping_add(offset as i32 as i64 as u64));
                     if success {
                         local.x.write(rd as usize, pc.wrapping_add(4));
                     }
+
+                    code = new_cptr;
+
                     continue;
                 },
 
 
                 Instr::Auipc { rd, offset } => {
-                    local.x.write(rd as usize, local.cache.pc().wrapping_add(offset as i64 as u64));
+                    local.x.write(rd as usize, local.cache.pc(code).wrapping_add(offset as i64 as u64));
                 },
 
 
@@ -717,28 +725,28 @@ impl Emulator {
                         break;
                     }
 
-                    local.trap(shared, cause, 0);
+                    code = local.trap(shared, code, cause, 0);
                     continue;
                 },
 
 
                 Instr::SEBreak { } => {
                     core::hint::cold_path();
-                    local.trap(shared, EXC_BREAKPOINT, local.cache.pc());
+                    code = local.trap(shared, code, EXC_BREAKPOINT, local.cache.pc(code));
                     continue;
                 },
 
 
                 Instr::SSRet { } => {
                     core::hint::cold_path();
-                    local.ret(shared, CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
+                    code = local.ret(shared, code, CSR_SSTATUS, CSR_SEPC, 1, 5, 8, 1);
                     continue;
                 },
 
 
                 Instr::SMRet { } => {
                     core::hint::cold_path();
-                    local.ret(shared, CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
+                    code = local.ret(shared, code, CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
                     continue;
                 },
 
@@ -750,8 +758,12 @@ impl Emulator {
 
                     if mie != 0 {
                         while (shared.csr.read(CSR_MIE) & shared.csr.read(CSR_MIP)) == 0 {
-                            let cont = local.tick(&shared);
+                            let (new_code, cont) = local.tick(shared, code);
                             if !cont { return false }
+
+                            if let Some(new_code) = new_code {
+                                code = new_code;
+                            }
                         }
                     }
                 },
@@ -873,8 +885,8 @@ impl Emulator {
                     let cond = lhs == rhs;
 
                     if cond {
-                        let pc = local.cache.pc();
-                        local.set_pc(shared, pc.wrapping_add(imm as u64));
+                        let pc = local.cache.pc(code);
+                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
                         continue;
                     }
                 },
@@ -887,8 +899,8 @@ impl Emulator {
                     let cond = lhs != rhs;
 
                     if cond {
-                        let pc = local.cache.pc();
-                        local.set_pc(shared, pc.wrapping_add(imm as u64));
+                        let pc = local.cache.pc(code);
+                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
                         continue;
                     }
                 },
@@ -901,8 +913,8 @@ impl Emulator {
                     let cond = lhs < rhs;
 
                     if cond {
-                        let pc = local.cache.pc();
-                        local.set_pc(shared, pc.wrapping_add(imm as u64));
+                        let pc = local.cache.pc(code);
+                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
                         continue;
                     }
                 },
@@ -915,8 +927,8 @@ impl Emulator {
                     let cond = lhs < rhs;
 
                     if cond {
-                        let pc = local.cache.pc();
-                        local.set_pc(shared, pc.wrapping_add(imm as u64));
+                        let pc = local.cache.pc(code);
+                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
                         continue;
                     }
                 },
@@ -929,8 +941,8 @@ impl Emulator {
                     let cond = lhs >= rhs;
 
                     if cond {
-                        let pc = local.cache.pc();
-                        local.set_pc(shared, pc.wrapping_add(imm as u64));
+                        let pc = local.cache.pc(code);
+                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
                         continue;
                     }
                 },
@@ -943,20 +955,22 @@ impl Emulator {
                     let cond = lhs >= rhs;
 
                     if cond {
-                        let pc = local.cache.pc();
-                        local.set_pc(shared, pc.wrapping_add(imm as u64));
+                        let pc = local.cache.pc(code);
+                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
                         continue;
                     }
                 },
 
 
                 Instr::JAlr { rd, rs1, imm } => {
-                    let pc = local.cache.pc();
+                    let pc = local.cache.pc(code);
                     let t = pc + 4;
-                    let status = local.set_pc(shared, local.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1));
+                    let (new_cptr, status) = local.set_pc(shared, code, local.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1));
                     if status {
                         local.x.write(rd as usize, t);
                     }
+
+                    code = new_cptr;
                     continue;
                 },
 
@@ -964,27 +978,27 @@ impl Emulator {
 
 
                 Instr::FenceI => {
-                    let pc = local.cache.pc();
+                    let pc = local.cache.pc(code);
                     local.cache.invalidate();
-                    local.cache.set_pc(&shared.mem, pc);
+                    code = local.cache.set_pc(&shared.mem, pc);
                 }
 
                 Instr::Unknown => {
-                    local.trap(shared, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(local.cache.pc())) as u64);
+                    code = local.trap(shared, code, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(local.cache.pc(code))) as u64);
                     continue;
                 },
 
 
                 Instr::Readjust => {
-                    let pc = local.cache.pc();
-                    local.set_pc(shared, pc);
+                    let pc = local.cache.pc(code);
+                    code = local.set_pc(shared, code, pc).0;
                     continue;
                 },
             }
 
 
             // finish
-            local.cache.next();
+            code.next();
         }
 
 
@@ -1142,22 +1156,21 @@ impl Csr {
 
 impl Local {
     #[inline(always)]
-    pub fn set_pc(&mut self, shared: &Shared, pc: u64) -> bool {
+    #[must_use]
+    pub fn set_pc(&mut self, shared: &Shared, code_ptr: CodePtr, pc: u64) -> (CodePtr, bool) {
         if pc & 0b11 != 0 {
-            self.trap(shared, EXC_INSTR_ADDR_MISALIGNED, pc);
-            false
+            (self.trap(shared, code_ptr, EXC_INSTR_ADDR_MISALIGNED, pc), false)
         } else {
-            self.cache.set_pc(&shared.mem, pc);
-            true
+            (self.cache.set_pc(&shared.mem, pc), true)
         }
     }
 
 
     fn ret(
-        &mut self, shared: &Shared,
+        &mut self, shared: &Shared, code_ptr: CodePtr,
         status_csr: usize, epc_csr: usize,
         ie_bit: u32, pie_bit: u32, pp_bit: u32, pp_len: u32
-    ) {
+    ) -> CodePtr {
         let mut mstatus = shared.csr.read(status_csr);
         let mpie = ubfx_64(mstatus, pie_bit, 1);
         let mpp  = ubfx_64(mstatus, pp_bit, pp_len);
@@ -1179,17 +1192,16 @@ impl Local {
 
         shared.csr.write(status_csr, mstatus);
         let epc = shared.csr.read(epc_csr);
-        self.set_pc(shared, epc);
-
+        self.set_pc(shared, code_ptr, epc).0
     }
 
 
     #[inline(always)]
-    pub fn tick(&mut self, shared: &Shared) -> bool {
+    pub fn tick(&mut self, shared: &Shared, code_ptr: CodePtr) -> (Option<CodePtr>, bool) {
         let cycle = shared.csr.read(CSR_CYCLE) + 1;
         shared.csr.write(CSR_CYCLE, cycle);
 
-        if core::hint::likely(cycle % 128 != 0) { return true }
+        if core::hint::likely(cycle % 128 != 0) { return (None, true) }
 
         // check interrupts
         let pending = shared.csr.read(CSR_MIP);
@@ -1197,12 +1209,13 @@ impl Local {
         let global_enabled = ubfx_64(shared.csr.read(CSR_MSTATUS), 3, 1);
 
 
+        let mut new_code = None;
         if ((pending & enabled) != 0) && global_enabled == 1 {
             for &code in INTERRUPTS.iter() {
                 let mask = 1 << code;
                 if (pending & mask != 0) && ((enabled & mask) != 0) {
                     let cause = (1 << 63) | code; // Bit 63 = interrupt
-                    self.trap(shared, cause, 0);
+                    new_code = Some(self.trap(shared, code_ptr, cause, 0));
                     break;
                 }
             }
@@ -1210,7 +1223,7 @@ impl Local {
 
 
 
-        if core::hint::likely(cycle % 1024 != 0) { return true }
+        if core::hint::likely(cycle % 1024 != 0) { return (new_code, true) }
 
         #[cold]
         fn cold(local: &mut Local, shared: &Shared) -> bool {
@@ -1239,11 +1252,11 @@ impl Local {
             true
         }
 
-        cold(self, shared)
+        (new_code, cold(self, shared))
     }
 
 
-    pub fn trap(&mut self, shared: &Shared, cause: u64, tval: u64) {
+    pub fn trap(&mut self, shared: &Shared, code_ptr: CodePtr, cause: u64, tval: u64) -> CodePtr {
         let medeleg = shared.csr.read(CSR_MEDELEG);
         let mideleg = shared.csr.read(CSR_MIDELEG);
 
@@ -1267,30 +1280,30 @@ impl Local {
 
 
         if delegated_to_s {
-            self._trap(
-                shared,
+            return self._trap(
+                shared, code_ptr,
                 CSR_SSTATUS, CSR_SEPC, CSR_SCAUSE, CSR_STVAL, CSR_STVEC,
                 1, 5, 8, 1, Priv::Supervisor, cause, tval
-            );
-            return;
+            )
         }
 
         self._trap(
-            shared,
+            shared, code_ptr,
             CSR_MSTATUS, CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MTVEC,
-            3, 7, 11, 2, Priv::Machine, cause, tval);
+            3, 7, 11, 2, Priv::Machine, cause, tval)
     }
 
 
     fn _trap(
         &mut self,
         shared: &Shared,
+        code_ptr: CodePtr,
 
         status_csr: usize, epc_csr: usize, cause_csr: usize,
         tval_csr: usize, tvec_csr: usize,
         ie_bit: u32, pie_bit: u32, pp_bit: u32, pp_len: u32,
         new_mode: Priv, cause: u64, tval: u64
-    ) {
+    ) -> CodePtr {
         let interrupt = (cause >> 63) & 1;
         let code  = cause & 0x7FFF_FFFF_FFFF_FFFF;
 
@@ -1306,7 +1319,7 @@ impl Local {
         status = bfi_64(status, pp_bit, pp_len, self.mode as u64);
 
         shared.csr.write(status_csr, status);
-        shared.csr.write(epc_csr, self.cache.pc());
+        shared.csr.write(epc_csr, self.cache.pc(code_ptr));
         shared.csr.write(cause_csr, mcause);
         shared.csr.write(tval_csr, tval);
 
@@ -1325,7 +1338,7 @@ impl Local {
                 base
             };
 
-        self.set_pc(shared, pc);
+        self.set_pc(shared, code_ptr, pc).0
     }
 
 

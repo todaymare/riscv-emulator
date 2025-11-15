@@ -2,9 +2,17 @@ use std::{alloc::{alloc, alloc_zeroed, dealloc, Layout}, ops::Range, sync::atomi
 
 use crate::Priv;
 
+
+const REGIONS : [Region; 5] = [
+    Region::new(0x0200_0000..0x0200_FFFF, Priv::User   ), // clint
+    Region::new(0x4000_0000..0x400e1000, Priv::User   ), // framebuffer
+    Region::new(0x4010_0000..0x4010_0010, Priv::User   ), // framebuffer settings
+    Region::new(0x8000_0000..0xA000_0000, Priv::User   ), // rom
+    Region::new(0xA000_0000..0xFFFF_FFFF, Priv::User   ), // ram
+];
+
 #[derive(Debug)]
 pub struct Memory {
-    regions: Vec<Region>,
     buff: SendPtr,
 
     pub mmio_kbd_status: AtomicU32,
@@ -42,14 +50,6 @@ impl Memory {
     pub fn new() -> Self {
         let buff = unsafe { alloc_zeroed(Layout::from_size_align(MEMORY_SIZE as _, 8).unwrap()) };
         Self {
-            regions: vec![
-                Region::new(0x0200_0000..0x0200_FFFF, Priv::User   ), // clint
-                Region::new(0x4000_0000..0x400e1000, Priv::User   ), // framebuffer
-                Region::new(0x4010_0000..0x4010_0010, Priv::User   ), // framebuffer settings
-                Region::new(0x8000_0000..0xA000_0000, Priv::User   ), // rom
-                Region::new(0xA000_0000..0xFFFF_FFFF, Priv::User   ), // ram
-            ],
-
             buff: SendPtr(buff.cast()),
 
 
@@ -92,7 +92,7 @@ impl Memory {
 
 
     pub fn read<'me>(&self, ptr: Ptr, size: usize) -> &[u8] {
-        for region in &self.regions {
+        for region in REGIONS {
             if region.range.contains(&ptr.0) {
                 assert!(ptr.0 <= region.range.end - size as u64);
 
@@ -114,7 +114,7 @@ impl Memory {
 
 
     pub fn read_sized<const N: usize>(&self, ptr: Ptr) -> [u8; N] {
-        for region in &self.regions {
+        for region in REGIONS {
             if region.range.contains(&ptr.0) {
                 assert!(ptr.0 <= region.range.end - N as u64);
 
@@ -149,7 +149,7 @@ impl Memory {
             }
         }
 
-        for region in &self.regions {
+        for region in REGIONS {
             if region.range.contains(&ptr.0) {
                 if (perm as u64) < (region.perm as u64) {
                     panic!("permission error");
@@ -186,7 +186,7 @@ impl Drop for Memory {
 
 
 impl Region {
-    pub fn new(range: Range<u64>, perm: Priv) -> Self {
+    pub const fn new(range: Range<u64>, perm: Priv) -> Self {
         Self {
             range,
             perm,

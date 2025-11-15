@@ -113,8 +113,12 @@ pub struct InstrCache {
 
     page_pc: u64,
     page_ptr: *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize],
-    code_ptr: *const Instr,
 }
+
+
+#[derive(Clone, Copy)]
+#[must_use]
+pub struct CodePtr(*const Instr);
 
 
 impl InstrCache {
@@ -123,12 +127,11 @@ impl InstrCache {
             pages: HashMap::new(),
             page_pc: 0,
             page_ptr: null(),
-            code_ptr: null(),
         }
     }
 
 
-    pub fn set_pc(&mut self, mem: &Memory, pc: u64) {
+    pub fn set_pc(&mut self, mem: &Memory, pc: u64) -> CodePtr {
         let page = pc >> PAGE_BITS;
         let page_pc = pc & !PAGE_MASK;
 
@@ -140,7 +143,7 @@ impl InstrCache {
         self.page_ptr = page_ptr;
 
         let offset = (pc - self.page_pc) / size_of::<u32>() as u64;
-        self.code_ptr = unsafe { self.page_ptr.as_ptr().add(offset as usize) };
+        CodePtr(unsafe { self.page_ptr.as_ptr().add(offset as usize) })
     }
 
 
@@ -148,30 +151,17 @@ impl InstrCache {
     pub fn invalidate(&mut self) {
         self.page_pc = 0;
         self.page_ptr = null();
-        self.code_ptr = null();
 
         self.pages.clear();
     }
 
 
     #[inline(always)]
-    pub fn pc(&self) -> u64 {
+    pub fn pc(&self, codeptr: CodePtr) -> u64 {
         unsafe {
-            let instr_index = self.code_ptr.offset_from(self.page_ptr.as_ptr()) as u64;
+            let instr_index = codeptr.0.offset_from(self.page_ptr.as_ptr()) as u64;
             self.page_pc + instr_index * size_of::<u32>() as u64
         }
-    }
-
-
-    #[inline(always)]
-    pub fn get(&self) -> Instr {
-        unsafe { *self.code_ptr }
-    }
-
-
-    #[inline(always)]
-    pub fn next(&mut self) {
-        unsafe { self.code_ptr = self.code_ptr.add(1) }
     }
 
 
@@ -199,6 +189,20 @@ impl InstrCache {
             },
         }
     }
+}
+
+
+impl CodePtr {
+    #[inline(always)]
+    pub fn get(self) -> Instr {
+        unsafe { *self.0 }
+    }
+
+    #[inline(always)]
+    pub fn next(&mut self) {
+        unsafe { self.0 = self.0.add(1) }
+    }
+
 }
 
 
