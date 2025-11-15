@@ -32,6 +32,7 @@ pub struct Local {
 
     start: Instant,
     last_ns: u64,
+
 }
 
 
@@ -154,6 +155,7 @@ impl Emulator {
         let shared = &self.shared;
         let mut local = self.local.lock().unwrap();
         let local = &mut *local;
+        let mut cycle = 0;
         local.start = Instant::now();
         local.last_ns = 0;
         local.x.write(2, 0xB000_0000);
@@ -164,12 +166,19 @@ impl Emulator {
         let mut code = local.cache.set_pc(&shared.mem, 0x8000_0000);
 
         loop {
-            let (new_code, cont) = local.tick(shared, code);
-            if !cont { return false }
+            cycle += 1;
+            if core::hint::unlikely(cycle % 128 == 0) {
+                shared.csr.write(CSR_CYCLE, cycle);
+                let (new_code, cont) = local.tick(cycle, shared, code);
+                if !cont { return false }
 
-            if let Some(new_code) = new_code {
-                code = new_code;
+                if let Some(new_code) = new_code {
+                    code = new_code;
+                }
             }
+
+
+
 
             // decode
             let instr = code.get();
@@ -757,11 +766,16 @@ impl Emulator {
 
                     if mie != 0 {
                         while (shared.csr.read(CSR_MIE) & shared.csr.read(CSR_MIP)) == 0 {
-                            let (new_code, cont) = local.tick(shared, code);
-                            if !cont { return false }
+                            cycle += 1;
+                            if core::hint::unlikely(cycle % 128 == 0) {
+                                shared.csr.write(CSR_CYCLE, cycle);
+                                let (new_code, cont) = local.tick(cycle, shared, code);
+                                if !cont { return false }
 
-                            if let Some(new_code) = new_code {
-                                code = new_code;
+                                if let Some(new_code) = new_code {
+                                    code = new_code;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1196,12 +1210,7 @@ impl Local {
 
 
     #[inline(always)]
-    pub fn tick(&mut self, shared: &Shared, code_ptr: CodePtr) -> (Option<CodePtr>, bool) {
-        let cycle = shared.csr.read(CSR_CYCLE) + 1;
-        shared.csr.write(CSR_CYCLE, cycle);
-
-        if core::hint::likely(cycle % 128 != 0) { return (None, true) }
-
+    pub fn tick(&mut self, cycle: u64, shared: &Shared, code_ptr: CodePtr) -> (Option<CodePtr>, bool) {
         // check interrupts
         let pending = shared.csr.read(CSR_MIP);
         let enabled = shared.csr.read(CSR_MIE);
