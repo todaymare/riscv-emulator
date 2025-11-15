@@ -126,7 +126,6 @@ impl Emulator {
     }
 
     pub fn trap(&mut self, cause: u64, tval: u64) {
-        println!("trpaped cause: 0b{cause:b} val: {}", tval);
 
         let medeleg = self.csr.read(CSR_MEDELEG);
         let mideleg = self.csr.read(CSR_MIDELEG);
@@ -136,12 +135,9 @@ impl Emulator {
 
         if interrupt {
             if code == INT_EXT_M as u64 || code == INT_EXT_S as u64 {
-                println!("clearing");
                 let mut mip = self.csr.read(CSR_MIP);
                 mip &= !(1 << code);
                 self.csr.write(CSR_MIP, mip);
-            } else {
-                println!("not clearing cos the code is {code:b}");
             }
         }
 
@@ -858,7 +854,6 @@ impl Emulator {
 
 
                 Instr::SMRet { } => {
-                    println!("0x{:x}", self.csr.read(CSR_MEPC));
                     core::hint::cold_path();
                     self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
                     continue;
@@ -1084,6 +1079,13 @@ impl Emulator {
 
                 Instr::Nop => (),
 
+
+                Instr::FenceI => {
+                    let pc = self.cache.pc();
+                    self.cache.invalidate();
+                    self.cache.set_pc(&self.mem, pc);
+                }
+
                 Instr::Unknown => {
                     core::hint::cold_path();
                     self.trap(EXC_ILLEGAL_INSTRUCTION, self.mem.read_u32(Ptr(self.cache.pc())) as u64);
@@ -1112,9 +1114,7 @@ impl Emulator {
 
 
     pub fn set_pc(&mut self, pc: u64) -> bool {
-        println!("hey new pc is at 0x{pc:x}");
         if pc & 0b11 != 0 {
-            println!("trapped?");
             self.trap(EXC_INSTR_ADDR_MISALIGNED, pc);
             false
         } else {
@@ -1131,7 +1131,6 @@ impl Emulator {
 
     pub fn write(&mut self, ptr: Ptr, data: &[u8]) {
         self.mem.write(self.mode, ptr, data);
-        self.cache.invalidate(&self.mem, ptr)
     }
 
 
@@ -1157,7 +1156,6 @@ impl Emulator {
 
         self.csr.write(status, mstatus);
         let epc = self.csr.read(epc);
-        println!("epc: 0x{epc:x}");
         self.set_pc(epc);
     }
 }

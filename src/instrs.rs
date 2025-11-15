@@ -91,6 +91,7 @@ pub enum Instr  {
 
     JAlr    { rd: u8, rs1: u8, imm: i16     },
 
+    FenceI,
     Nop,
     Unknown,
 
@@ -143,19 +144,12 @@ impl InstrCache {
     }
 
 
-    pub fn invalidate(&mut self, mem: &Memory, ptr: Ptr) {
-        let page = ptr.0 >> PAGE_BITS;
-        if let Some(val) = self.pages.remove(&page) {
-            println!("invalidated 0x{page:x}");
-            if self.page_ptr == val {
-                let page = self.load_page(page, mem);
-                let offset = unsafe { self.code_ptr.offset_from(self.page_ptr.as_ptr()) };
-                self.page_ptr = page;
-                unsafe { self.code_ptr = self.page_ptr.as_ptr().offset(offset) };
-            }
+    pub fn invalidate(&mut self) {
+        self.page_pc = 0;
+        self.page_ptr = null();
+        self.code_ptr = null();
 
-            unsafe { drop(Box::from_raw(val)) };
-        }
+        self.pages.clear();
     }
 
 
@@ -402,8 +396,11 @@ impl Instr {
 
             // fence & fence.i
             0b0001111 => {
-                // WHAT THE FUCK IS A FENCE RAAAAA
-                Instr::Nop
+                let funct3 = ubfx_32(instr, 12, 3);
+                match funct3 {
+                    0b001 => Instr::FenceI,
+                    _ => Instr::Nop
+                }
             }
 
 
