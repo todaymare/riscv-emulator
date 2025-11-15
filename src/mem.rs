@@ -4,11 +4,11 @@ use crate::Priv;
 
 
 const REGIONS : [Region; 5] = [
-    Region::new(0x0200_0000..0x0200_FFFF, Priv::User   ), // clint
+    Region::new(0x8000_0000..0xFFFF_FFFF, Priv::User   ), // ram
+    Region::new(0x8000_0000..0xA000_0000, Priv::User   ), // rom
     Region::new(0x4000_0000..0x400e1000, Priv::User   ), // framebuffer
     Region::new(0x4010_0000..0x4010_0010, Priv::User   ), // framebuffer settings
-    Region::new(0x8000_0000..0xA000_0000, Priv::User   ), // rom
-    Region::new(0xA000_0000..0xFFFF_FFFF, Priv::User   ), // ram
+    Region::new(0x0200_0000..0x0200_FFFF, Priv::User   ), // clint
 ];
 
 #[derive(Debug)]
@@ -94,7 +94,7 @@ impl Memory {
     pub fn read<'me>(&self, ptr: Ptr, size: usize) -> &[u8] {
         for region in REGIONS {
             if region.range.contains(&ptr.0) {
-                assert!(ptr.0 <= region.range.end - size as u64);
+                debug_assert!(ptr.0 <= region.range.end - size as u64);
 
                 unsafe {
 
@@ -109,6 +109,7 @@ impl Memory {
             }
         }
 
+        core::hint::cold_path();
         panic!("bus error {:x}", ptr.0);
     }
 
@@ -116,7 +117,7 @@ impl Memory {
     pub fn read_sized<const N: usize>(&self, ptr: Ptr) -> [u8; N] {
         for region in REGIONS {
             if region.range.contains(&ptr.0) {
-                assert!(ptr.0 <= region.range.end - N as u64);
+                debug_assert!(ptr.0 <= region.range.end - N as u64);
 
                 unsafe {
                 let mut ptr = self.buff.0.add(ptr.0 as usize).cast();
@@ -129,6 +130,7 @@ impl Memory {
             }
         }
 
+        core::hint::cold_path();
         panic!("bus error {:x}", ptr.0);
     }
 
@@ -151,21 +153,15 @@ impl Memory {
 
         for region in REGIONS {
             if region.range.contains(&ptr.0) {
-                if (perm as u64) < (region.perm as u64) {
+                if core::hint::unlikely((perm as u64) < (region.perm as u64)) {
                     panic!("permission error");
                 }
-
-                assert!(ptr.0 <= region.range.end - data.len() as u64);
 
                 unsafe {
 
                 let mut ptr = self.buff.0.add(ptr.0 as usize);
                 core::hint::black_box(&mut ptr);
                 core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-                /*
-                for i in 0..data.len() {
-                    (&*ptr.add(i)).store(data[i], std::sync::atomic::Ordering::Relaxed);
-                }*/
 
                 }
 
@@ -173,6 +169,7 @@ impl Memory {
             }
         }
 
+        core::hint::cold_path();
         panic!("bus error 0x{:x}", ptr.0);
     }
 }

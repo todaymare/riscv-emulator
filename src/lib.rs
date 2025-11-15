@@ -32,7 +32,6 @@ pub struct Local {
 
     start: Instant,
     last_ns: u64,
-
 }
 
 
@@ -1348,7 +1347,7 @@ impl Local {
 
 
 pub struct Regs {
-    regs: [u64; 32]
+    pub regs: [u64; 32]
 }
 
 
@@ -1362,15 +1361,14 @@ impl Regs {
 
     #[inline(always)]
     pub fn read(&self, idx: usize) -> u64 {
-        self.regs[idx]
+        unsafe { *self.regs.get_unchecked(idx) }
     }
 
 
     #[inline(always)]
     pub fn write(&mut self, idx: usize, data: u64) {
-        cold_path();
         if idx == 0 { return }
-        self.regs[idx] = data;
+        unsafe { *self.regs.get_unchecked_mut(idx) = data; }
     }
 }
 

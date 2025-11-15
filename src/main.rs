@@ -248,7 +248,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
             let result = em_thread.run(&file);
             let time = time.elapsed();
             let cycles = em_thread.shared.csr.read(0xC00);
-            println!("{cycles} cycles in {time:?} {:.2}MIPS", (cycles as f64 / time.as_secs_f64()) / 1_000_000.0);
+            println!("{cycles} cycles in {time:?} {:.2}MIPS {:.2}ns/I", (cycles as f64 / time.as_secs_f64()) / 1_000_000.0, time.as_secs_f64() * 1_000_000_000.0 / cycles as f64);
             result
         })
     );
