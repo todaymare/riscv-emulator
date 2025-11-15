@@ -1,4 +1,4 @@
-use std::{alloc::{alloc, alloc_zeroed, Layout}, ops::Range, sync::atomic::AtomicU8};
+use std::{alloc::{alloc, alloc_zeroed, dealloc, Layout}, ops::Range, sync::atomic::{AtomicU32, AtomicU8}};
 
 use crate::Priv;
 
@@ -6,7 +6,21 @@ use crate::Priv;
 pub struct Memory {
     regions: Vec<Region>,
     buff: SendPtr,
+
+    pub mmio_kbd_status: AtomicU32,
+    pub mmio_kbd_key   : AtomicU32,
+    pub mmio_kbd_mods  : AtomicU32,
+    pub mmio_kbd_irq   : AtomicU32,
 }
+
+
+const MMIO_KBD_STATUS : u64 = 0x1000_0000;
+const MMIO_KBD_KEY    : u64 = 0x1000_0004;
+const MMIO_KBD_MODS   : u64 = 0x1000_0008;
+const MMIO_KBD_IRQ    : u64 = 0x1000_000C;
+
+
+const MEMORY_SIZE : u64 = 0xFFFF_FFFF;
 
 
 #[derive(Debug)]
@@ -26,16 +40,25 @@ pub struct Region {
 
 impl Memory {
     pub fn new() -> Self {
-        let buff = unsafe { alloc_zeroed(Layout::from_size_align(0xFFFF_FFFF, 8).unwrap()) };
+        let buff = unsafe { alloc_zeroed(Layout::from_size_align(MEMORY_SIZE as _, 8).unwrap()) };
         Self {
             regions: vec![
                 Region::new(0x0200_0000..0x0200_FFFF, Priv::User   ), // clint
-                Region::new(0x1000_0000..0x2000_0000, Priv::User   ), // framebuffer
+                Region::new(0x4000_0000..0x400e1000, Priv::User   ), // framebuffer
+                Region::new(0x4010_0000..0x4010_0010, Priv::User   ), // framebuffer settings
                 Region::new(0x8000_0000..0xA000_0000, Priv::User   ), // rom
                 Region::new(0xA000_0000..0xFFFF_FFFF, Priv::User   ), // ram
             ],
 
-            buff: SendPtr(buff),
+            buff: SendPtr(buff.cast()),
+
+
+            mmio_kbd_status: AtomicU32::default(),
+            mmio_kbd_key: AtomicU32::default(),
+            mmio_kbd_mods: AtomicU32::default(),
+            mmio_kbd_irq: AtomicU32::default(),
+
+            
         }
     }
 
@@ -51,7 +74,14 @@ impl Memory {
 
 
     pub fn read_u32(&self, ptr: Ptr) -> u32 {
-        u32::from_ne_bytes(self.read_sized(ptr))
+        match ptr.0 {
+            MMIO_KBD_STATUS => self.mmio_kbd_status.load(std::sync::atomic::Ordering::Acquire),
+            MMIO_KBD_KEY    => self.mmio_kbd_key.swap(0, std::sync::atomic::Ordering::AcqRel),
+            MMIO_KBD_MODS   => self.mmio_kbd_mods.load(std::sync::atomic::Ordering::Acquire),
+            MMIO_KBD_IRQ    => self.mmio_kbd_irq.load(std::sync::atomic::Ordering::Acquire),
+            _ => u32::from_ne_bytes(self.read_sized(ptr))
+        }
+        
     }
 
 
@@ -104,6 +134,21 @@ impl Memory {
 
 
     pub fn write<'me>(&self, perm: Priv, ptr: Ptr, data: &[u8]) {
+
+        if data.len() == 4 {
+            match ptr.0 {
+                MMIO_KBD_IRQ => {
+                    self.mmio_kbd_irq.store(
+                        u32::from_ne_bytes(data.try_into().unwrap()), 
+                        std::sync::atomic::Ordering::Release
+                    );
+                    return;
+                }
+
+                _ => (),
+            }
+        }
+
         for region in &self.regions {
             if region.range.contains(&ptr.0) {
                 if (perm as u64) < (region.perm as u64) {
@@ -128,7 +173,14 @@ impl Memory {
             }
         }
 
-        panic!("bus error");
+        panic!("bus error 0x{:x}", ptr.0);
+    }
+}
+
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.buff.0, Layout::from_size_align(MEMORY_SIZE as _, 8).unwrap()); }
     }
 }
 

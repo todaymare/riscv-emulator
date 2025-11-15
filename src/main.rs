@@ -1,9 +1,9 @@
-use std::{any::Any, collections::HashMap, env, ffi::OsStr, option, panic, sync::{Arc, Mutex}, thread::JoinHandle, time::Instant};
+use std::{any::Any, collections::HashMap, env, ffi::OsStr, option, panic, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, thread::JoinHandle, time::Instant};
 
 use colourful::{Colour, ColourBrush};
 use pixels::{Pixels, SurfaceTexture};
-use riscv_emulator::{mem::{Memory, Ptr}, Emulator};
-use winit::{application::ApplicationHandler, dpi::PhysicalSize, event_loop::EventLoop, window::{Window, WindowAttributes}};
+use riscv_emulator::{mem::{Memory, Ptr}, Csr, Emulator, CSR_MIP, INT_EXT_M, INT_EXT_S};
+use winit::{application::ApplicationHandler, dpi::PhysicalSize, event::ElementState, event_loop::EventLoop, keyboard::Key, window::{Window, WindowAttributes}};
 
 
 #[derive(Default)]
@@ -29,6 +29,7 @@ fn main() {
     let mut options = Options::default();
     options.timeout = u64::MAX;
 
+    dbg!(&options_env);
     for opt in options_env.split(';') {
         let mut words = opt.split_whitespace();
         let word = words.next().unwrap_or("");
@@ -48,6 +49,7 @@ fn main() {
 
             "framebuffer" => {
                 options.framebuffer = true;
+                println!("framebuffer");
             }
             _ => println!("unknown option '{opt}'"),
         }
@@ -93,9 +95,9 @@ fn main() {
 
                 let bucket = buckets.get_mut(bucket).unwrap();
 
-                println!("{}: ", name);
                 let result = test_file(&options, name);
 
+                print!("{}: ", name);
                 match result {
                     TestResult::Pass(_) => {
                         bucket.pass += 1;
@@ -233,6 +235,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
 
     let em = Emulator::new();
     let mem = em.mem.clone();
+    let csr = em.csr.clone();
 
     let em = Arc::new(Mutex::new(em));
 
@@ -243,8 +246,8 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
             let time = Instant::now();
             let result = em_thread.lock().unwrap().run(timeout, &file);
             let time = time.elapsed();
-            let cycles = em_thread.lock().unwrap().csr_read(0xC00);
-            println!("{cycles} cycles in {time:?}");
+            let cycles = em_thread.lock().unwrap().csr.read(0xC00);
+            //println!("{cycles} cycles in {time:?}");
             result
         })
     );
@@ -257,6 +260,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
             data: None,
             cpu: &result,
             mem: &mem,
+            csr: &csr,
         };
 
 
@@ -266,7 +270,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
 
 
     let result = result.join().unwrap();
-    println!("took {:?}", now.elapsed());
+    //println!("took {:?}", now.elapsed());
 
     if let Err(e) = result {
         if let Some(msg) = e.downcast_ref::<&str>() {
@@ -304,6 +308,7 @@ struct App<'a> {
     data: Option<AppInner>,
     cpu: &'a JoinHandle<Result<bool, Box<dyn Any + Send + 'static>>>,
     mem: &'a Memory,
+    csr: &'a Csr,
 }
 
 
@@ -352,7 +357,9 @@ impl ApplicationHandler for App<'_> {
             winit::event::WindowEvent::RedrawRequested => {
                 let data = self.data.as_mut().unwrap();
 
-                let settings = Ptr(0x1000_0000);
+                let settings = Ptr(0x4010_0000);
+
+
                 loop {
                     let is_frame_ready = self.mem.read_u8(settings);
                     if is_frame_ready == 1 {
@@ -368,8 +375,10 @@ impl ApplicationHandler for App<'_> {
 
                 }
 
+
                 let buf = data.pixels.frame_mut();
-                let ptr = Ptr(0x1000_00FF);
+                let ptr = Ptr(0x4000_0000);
+                println!("0x{:x}", ptr.0 + buf.len() as u64);
 
                 buf.copy_from_slice(self.mem.read(ptr, buf.len()));
                 self.mem.write(riscv_emulator::Priv::Machine, settings, &[0]);
@@ -382,6 +391,33 @@ impl ApplicationHandler for App<'_> {
                 }
 
                 data.window.request_redraw();
+            }
+
+
+            winit::event::WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
+                println!("event {event:?}");
+        // Only care when key is pressed
+                if event.state == ElementState::Pressed {
+                    if let Key::Character(text) = &event.logical_key {
+                        // Take the first char (winit gives a String)
+                        if let Some(ch) = text.chars().next() {
+                            let ascii = ch as u32;
+                            self.mem.mmio_kbd_key.store(ascii, Ordering::Release);
+                            self.mem.mmio_kbd_status.store(1, Ordering::Release);
+
+                            let irq = self.mem.mmio_kbd_irq.load(Ordering::Relaxed);
+                            // If interrupts are enabled:
+                            if irq != 0 {
+                                let mut mip = self.csr.read(CSR_MIP);
+                                mip |= 1 << INT_EXT_M;
+                                println!("0b{:b}", mip);
+                                self.csr.write(CSR_MIP, mip);
+                            } else {
+                                println!("irq was 0b{irq:b}");
+                            }
+                        }
+                    }
+                }
             }
             _ => (),
         }

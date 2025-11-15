@@ -5,7 +5,7 @@ pub mod mem;
 pub mod utils;
 pub mod instrs;
 
-use std::{hint::cold_path, mem::discriminant, ops::Rem, process::exit, ptr::null, sync::Arc, thread::sleep_ms, time::Instant};
+use std::{hint::cold_path, mem::discriminant, ops::Rem, process::exit, ptr::null, sync::{atomic::{AtomicU64, Ordering}, Arc}, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
 
@@ -18,7 +18,12 @@ pub struct Emulator {
     mode: Priv,
     pub x  : Regs,
 
-    csr: [u64; 4096],
+    pub csr: Arc<Csr>,
+}
+
+
+pub struct Csr {
+    csr: [AtomicU64; 4096],
 }
 
 
@@ -33,75 +38,79 @@ pub enum Priv {
 }
 
 
-const CSR_MVENDORID : usize = 0xF11;
-const CSR_MARCHID : usize = 0xF12;
-const CSR_MIMPID : usize = 0xF13;
-const CSR_MHARTID : usize = 0xF14;
+pub const CSR_MVENDORID : usize = 0xF11;
+pub const CSR_MARCHID : usize = 0xF12;
+pub const CSR_MIMPID : usize = 0xF13;
+pub const CSR_MHARTID : usize = 0xF14;
 
-const CSR_MSTATUS: usize = 0x300;
-const CSR_MISA: usize = 0x301;
-const CSR_MEDELEG: usize = 0x302;
-const CSR_MIDELEG: usize = 0x303;
-const CSR_MIE: usize = 0x304;
-const CSR_MTVEC  : usize = 0x305;
-const CSR_MCOUNTEREN : usize = 0x306;
-const CSR_MSCRATCH : usize = 0x340;
-const CSR_MEPC   : usize = 0x341;
-const CSR_MCAUSE : usize = 0x342;
-const CSR_MTVAL  : usize = 0x343;
-const CSR_MIP: usize = 0x344;
-const CSR_MTINST: usize = 0x34A;
-const CSR_MTVAL2: usize = 0x34B;
+pub const CSR_MSTATUS: usize = 0x300;
+pub const CSR_MISA: usize = 0x301;
+pub const CSR_MEDELEG: usize = 0x302;
+pub const CSR_MIDELEG: usize = 0x303;
+pub const CSR_MIE: usize = 0x304;
+pub const CSR_MTVEC  : usize = 0x305;
+pub const CSR_MCOUNTEREN : usize = 0x306;
+pub const CSR_MSCRATCH : usize = 0x340;
+pub const CSR_MEPC   : usize = 0x341;
+pub const CSR_MCAUSE : usize = 0x342;
+pub const CSR_MTVAL  : usize = 0x343;
+pub const CSR_MIP: usize = 0x344;
+pub const CSR_MTINST: usize = 0x34A;
+pub const CSR_MTVAL2: usize = 0x34B;
 
-const CSR_CYCLE  : usize = 0xC00;
-const CSR_SEPC: usize = 0x141;
-const CSR_SCAUSE: usize = 0x142;
-const CSR_STVAL: usize = 0x143;
-const CSR_STVEC: usize = 0x105;
-const CSR_SSTATUS: usize = 0x100;
-
-
-const CSR_TSELECT : usize = 0x7A0;
-const CSR_TDATA1  : usize = 0x7A1;
-const CSR_TDATA2  : usize = 0x7A2;
-const CSR_TCONTROL: usize = 0x7A5;
+pub const CSR_CYCLE  : usize = 0xC00;
+pub const CSR_SEPC: usize = 0x141;
+pub const CSR_SCAUSE: usize = 0x142;
+pub const CSR_STVAL: usize = 0x143;
+pub const CSR_STVEC: usize = 0x105;
+pub const CSR_SSTATUS: usize = 0x100;
+pub const CSR_SIP : usize = 0x144;
 
 
-const EXC_INSTR_ADDR_MISALIGNED: u64 = 0;
-const EXC_INSTR_ACCESS_FAULT:     u64 = 1;
-const EXC_ILLEGAL_INSTRUCTION:    u64 = 2;
-const EXC_BREAKPOINT:             u64 = 3;
-const EXC_LOAD_ADDR_MISALIGNED:   u64 = 4;
-const EXC_LOAD_ACCESS_FAULT:      u64 = 5;
-const EXC_STORE_ADDR_MISALIGNED:  u64 = 6;
-const EXC_STORE_ACCESS_FAULT:     u64 = 7;
-const EXC_ECALL_UMODE:            u64 = 8;
-const EXC_ECALL_SMODE:            u64 = 9;
+pub const CSR_TSELECT : usize = 0x7A0;
+pub const CSR_TDATA1  : usize = 0x7A1;
+pub const CSR_TDATA2  : usize = 0x7A2;
+pub const CSR_TCONTROL: usize = 0x7A5;
+
+
+pub const EXC_INSTR_ADDR_MISALIGNED: u64 = 0;
+pub const EXC_INSTR_ACCESS_FAULT:     u64 = 1;
+pub const EXC_ILLEGAL_INSTRUCTION:    u64 = 2;
+pub const EXC_BREAKPOINT:             u64 = 3;
+pub const EXC_LOAD_ADDR_MISALIGNED:   u64 = 4;
+pub const EXC_LOAD_ACCESS_FAULT:      u64 = 5;
+pub const EXC_STORE_ADDR_MISALIGNED:  u64 = 6;
+pub const EXC_STORE_ACCESS_FAULT:     u64 = 7;
+pub const EXC_ECALL_UMODE:            u64 = 8;
+pub const EXC_ECALL_SMODE:            u64 = 9;
 // 10 is reserved
-const EXC_ECALL_MMODE:            u64 = 11;
-const EXC_INSTR_PAGE_FAULT:       u64 = 12;
-const EXC_LOAD_PAGE_FAULT:        u64 = 13;
+pub const EXC_ECALL_MMODE:            u64 = 11;
+pub const EXC_INSTR_PAGE_FAULT:       u64 = 12;
+pub const EXC_LOAD_PAGE_FAULT:        u64 = 13;
 // 14 reserved
-const EXC_STORE_PAGE_FAULT:       u64 = 15;
+pub const EXC_STORE_PAGE_FAULT:       u64 = 15;
 
 
-const INT_SOFT_S: u64 = 1;
-const INT_SOFT_M: u64 = 3;
+pub const INT_SOFT_S: u64 = 1;
+pub const INT_SOFT_M: u64 = 3;
 
-const INT_TIMER_S: u64 = 5;
-const INT_TIMER_M: u64 = 7;
+pub const INT_TIMER_S: u64 = 5;
+pub const INT_TIMER_M: u64 = 7;
 
-const INT_EXT_S: u64 = 9;
-const INT_EXT_M: u64 = 11;
+pub const INT_EXT_S: u64 = 9;
+pub const INT_EXT_M: u64 = 11;
 
-const MTIME   : usize = 0x0200_BFF8;
-const MTIMECMP: usize = 0x0200_4000;
+pub const MTIME   : usize = 0x0200_BFF8;
+pub const MTIMECMP: usize = 0x0200_4000;
 
 
-const INTERRUPTS: [u64; 3] = [
-    3,  // Machine software
-    7,  // Machine timer
-    11, // Machine external
+const INTERRUPTS: [u64; 6] = [
+    INT_SOFT_S,
+    INT_SOFT_M,
+    INT_TIMER_S,
+    INT_TIMER_M,
+    INT_EXT_S,
+    INT_EXT_M,
 ];
 
 
@@ -110,19 +119,32 @@ impl Emulator {
         Self {
             mem: Arc::new(Memory::new()),
             x: Regs::new(),
-            csr: [0; _],
+            csr: Arc::new(Csr::new()),
             mode: Priv::Machine,
             cache: InstrCache::new(),
         }
     }
 
     pub fn trap(&mut self, cause: u64, tval: u64) {
+        println!("trpaped cause: 0b{cause:b} val: {}", tval);
 
-        let medeleg = self.csr_read(CSR_MEDELEG);
-        let mideleg = self.csr_read(CSR_MIDELEG);
+        let medeleg = self.csr.read(CSR_MEDELEG);
+        let mideleg = self.csr.read(CSR_MIDELEG);
 
         let interrupt = (cause >> 63) != 0;
-        let code = cause & (u64::MAX >> 1);
+        let code = cause & 0x7FFF_FFFF_FFFF_FFFF;
+
+        if interrupt {
+            if code == INT_EXT_M as u64 || code == INT_EXT_S as u64 {
+                println!("clearing");
+                let mut mip = self.csr.read(CSR_MIP);
+                mip &= !(1 << code);
+                self.csr.write(CSR_MIP, mip);
+            } else {
+                println!("not clearing cos the code is {code:b}");
+            }
+        }
+
 
         let delegated_to_s = if interrupt {
             ((mideleg >> code) & 1) != 0
@@ -150,57 +172,56 @@ impl Emulator {
         pp_bit: u32, pp_len: u32, new_mode: Priv, cause: u64, tval: u64
     ) {
         let interrupt = (cause >> 63) & 1;
-        let raw_code  = cause & 0x7FFF_FFFF_FFFF_FFFF;
-        let code5     = raw_code & 0x1F;
+        let code  = cause & 0x7FFF_FFFF_FFFF_FFFF;
 
         // real mcause value
-        let mcause = (interrupt << 63) | code5;
+        let mcause = (interrupt << 63) | code;
 
         // read & update status
-        let mut status = self.csr_read(status_csr);
+        let mut status = self.csr.read(status_csr);
         let ie = ubfx_64(status, ie_bit, 1);
 
         status = bfi_64(status, pie_bit, 1, ie);
         status = bfi_64(status, ie_bit, 1, 0);
         status = bfi_64(status, pp_bit, pp_len, self.mode as u64);
 
-        self.csr_write(status_csr, status);
-        self.csr_write(epc_csr, self.cache.pc());
-        self.csr_write(cause_csr, mcause);
-        self.csr_write(tval_csr, tval);
+        self.csr.write(status_csr, status);
+        self.csr.write(epc_csr, self.cache.pc());
+        self.csr.write(cause_csr, mcause);
+        self.csr.write(tval_csr, tval);
 
         // switch privilege
         self.mode = new_mode;
 
         // redirect PC
-        let tvec = self.csr_read(tvec_csr);
+        let tvec = self.csr.read(tvec_csr);
         let base = tvec & !0b11;
         let tmode = tvec & 0b11;
 
         let pc = 
             if tmode == 1 && interrupt != 0 {
-                base + 4 * code5
+                base + 4 * (code & 0x1F)
             } else {
                 base
             };
 
-        self.cache.set_pc(&self.mem, pc);
+        self.set_pc(pc);
     }
 
 
-    pub fn tick_timer(&mut self, start: &Instant, timeout_ms: u64, last_ns: &mut u128) -> bool {
-        let cycle = self.csr_read(CSR_CYCLE) + 1;
-        self.csr_write(CSR_CYCLE, cycle);
+    pub fn tick_timer(&mut self, start: &Instant, timeout_ms: u64, last_ns: &mut u64) -> bool {
+        let cycle = self.csr.read(CSR_CYCLE) + 1;
+        self.csr.write(CSR_CYCLE, cycle);
 
         if cycle % 1000 != 0 { return true }
         let mut mtime = self.mem.read_u64(Ptr(MTIME as _));
 
-        const MTIME_TICK_NS: u128 = 100; // 10MHz
+        const MTIME_TICK_NS: u64 = 100; // 10MHz
         let elapsed = start.elapsed();
 
         if elapsed.as_millis() as u64 > timeout_ms { return false }
 
-        let now = elapsed.as_nanos();
+        let now = elapsed.as_nanos() as u64;
         let dt = now - *last_ns;
 
         let div = dt / MTIME_TICK_NS;
@@ -213,8 +234,8 @@ impl Emulator {
 
         let bit = mtime >= self.mem.read_u64(Ptr(MTIMECMP as _));
         let bit = bit as u64;
-        let mip = bfi_64(self.csr_read(CSR_MIP), 7, 1, bit);
-        self.csr_write(CSR_MIP, mip);
+        let mip = bfi_64(self.csr.read(CSR_MIP), 7, 1, bit);
+        self.csr.write(CSR_MIP, mip);
         true
     }
     
@@ -229,7 +250,7 @@ impl Emulator {
         self.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
         self.mem.write(self.mode, Ptr(0x8000_0000), code);
 
-        self.cache.set_pc(&self.mem, 0x8000_0000);
+        self.set_pc(0x8000_0000);
 
         loop {
             let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
@@ -237,15 +258,15 @@ impl Emulator {
 
 
             // check interrupts
-            let pending = self.csr_read(CSR_MIP);
-            let enabled = self.csr_read(CSR_MIE);
-            let global_enabled = ubfx_64(self.csr_read(CSR_MSTATUS), 3, 1);
+            let pending = self.csr.read(CSR_MIP);
+            let enabled = self.csr.read(CSR_MIE);
+            let global_enabled = ubfx_64(self.csr.read(CSR_MSTATUS), 3, 1);
 
 
-            if (pending & enabled != 0) && global_enabled == 1 {
+            if ((pending & enabled) != 0) && global_enabled == 1 {
                 for &code in INTERRUPTS.iter() {
                     let mask = 1 << code;
-                    if (pending & mask != 0) && (enabled & mask != 0) {
+                    if (pending & mask != 0) && ((enabled & mask) != 0) {
                         let cause = (1 << 63) | code; // Bit 63 = interrupt
                         self.trap(cause, 0);
                         break;
@@ -695,8 +716,10 @@ impl Emulator {
 
                 Instr::Jal { rd, offset } => {
                     let pc = self.cache.pc();
-                    self.x.write(rd as usize, pc.wrapping_add(4));
-                    self.cache.set_pc(&self.mem, pc.wrapping_add(offset as i32 as i64 as u64));
+                    let success = self.set_pc(pc.wrapping_add(offset as i32 as i64 as u64));
+                    if success {
+                        self.x.write(rd as usize, pc.wrapping_add(4));
+                    }
                     continue;
                 },
 
@@ -714,9 +737,9 @@ impl Emulator {
                 Instr::CsrRw { rd, rs1, csr } => {
                     core::hint::cold_path();
                     let csr = csr as usize;
-                    let t = self.csr_read(csr);
+                    let t = self.csr.read(csr);
 
-                    self.csr_write(csr, self.x.read(rs1 as usize));
+                    self.csr.write(csr, self.x.read(rs1 as usize));
 
                     self.x.write(rd as usize, t);
                 },
@@ -725,10 +748,10 @@ impl Emulator {
                 Instr::CsrRs { rd, rs1, csr } => {
                     core::hint::cold_path();
                     let csr = csr as usize;
-                    let t = self.csr_read(csr);
+                    let t = self.csr.read(csr);
 
                     if rs1 != 0 {
-                        self.csr_write(csr, t | self.x.read(rs1 as usize));
+                        self.csr.write(csr, t | self.x.read(rs1 as usize));
                     }
 
                     self.x.write(rd as usize, t);
@@ -738,10 +761,10 @@ impl Emulator {
                 Instr::CsrRc { rd, rs1, csr } => {
                     core::hint::cold_path();
                     let csr = csr as usize;
-                    let t = self.csr_read(csr);
+                    let t = self.csr.read(csr);
 
                     if rs1 != 0 {
-                        self.csr_write(csr, t & !self.x.read(rs1 as usize));
+                        self.csr.write(csr, t & !self.x.read(rs1 as usize));
                     }
 
                     self.x.write(rd as usize, t);
@@ -751,10 +774,10 @@ impl Emulator {
                 Instr::CsrRwi { rd, rs1, csr } => {
                     core::hint::cold_path();
                     let csr = csr as usize;
-                    let t = self.csr_read(csr);
+                    let t = self.csr.read(csr);
 
                     if rs1 != 0 {
-                        self.csr_write(csr, (rs1 & 0x1f) as _);
+                        self.csr.write(csr, (rs1 & 0x1f) as _);
                     }
 
                     self.x.write(rd as usize, t);
@@ -764,10 +787,10 @@ impl Emulator {
                 Instr::CsrRsi { rd, rs1, csr } => {
                     core::hint::cold_path();
                     let csr = csr as usize;
-                    let t = self.csr_read(csr);
+                    let t = self.csr.read(csr);
 
                     if rs1 != 0 {
-                        self.csr_write(csr, t | rs1 as u64);
+                        self.csr.write(csr, t | rs1 as u64);
                     }
 
                     self.x.write(rd as usize, t);
@@ -777,10 +800,10 @@ impl Emulator {
                 Instr::CsrRci { rd, rs1, csr } => {
                     core::hint::cold_path();
                     let csr = csr as usize;
-                    let t = self.csr_read(csr);
+                    let t = self.csr.read(csr);
 
                     if rs1 != 0 {
-                        self.csr_write(csr, t & !(rs1 as u64));
+                        self.csr.write(csr, t & !(rs1 as u64));
                     }
 
                     self.x.write(rd as usize, t);
@@ -813,10 +836,6 @@ impl Emulator {
                         }
 
                         let msg = core::str::from_utf8(&msg).unwrap();
-
-                        panic!("{msg}");
-
-
                     }
 
                     self.trap(cause, 0);
@@ -839,6 +858,7 @@ impl Emulator {
 
 
                 Instr::SMRet { } => {
+                    println!("0x{:x}", self.csr.read(CSR_MEPC));
                     core::hint::cold_path();
                     self._ret(CSR_MSTATUS, CSR_MEPC, 3, 7, 11, 2);
                     continue;
@@ -847,9 +867,14 @@ impl Emulator {
 
                 Instr::SWfi { } => {
                     core::hint::cold_path();
-                    while self.csr_read(CSR_MIE) & self.csr_read(CSR_MIP) == 0 {
-                        let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
-                        if !cont { return false }
+                    let mstatus = self.csr.read(CSR_MSTATUS);
+                    let mie = (mstatus >> 3) & 1; // MIE bit in mstatus
+
+                    if mie != 0 {
+                        while (self.csr.read(CSR_MIE) & self.csr.read(CSR_MIP)) == 0 {
+                            let cont = self.tick_timer(&start, timeout_ms, &mut last_ns);
+                            if !cont { return false }
+                        }
                     }
                 },
 
@@ -929,7 +954,7 @@ impl Emulator {
 
                     let slice = &[(self.x.read(rs2 as usize) & 0xFF) as u8];
 
-                    self.mem.write(self.mode, ptr, slice);
+                    self.write(ptr, slice);
                 },
 
 
@@ -939,7 +964,7 @@ impl Emulator {
 
                     let slice = &((self.x.read(rs2 as usize) & 0xFFFF) as u16).to_ne_bytes();
 
-                    self.mem.write(self.mode, ptr, slice);
+                    self.write(ptr, slice);
                 },
 
 
@@ -949,7 +974,7 @@ impl Emulator {
 
                     let slice = &((self.x.read(rs2 as usize) & 0xFFFF_FFFF) as u32).to_ne_bytes();
 
-                    self.mem.write(self.mode, ptr, slice);
+                    self.write(ptr, slice);
                 },
 
 
@@ -959,7 +984,7 @@ impl Emulator {
 
                     let slice = &self.x.read(rs2 as usize).to_ne_bytes();
 
-                    self.mem.write(self.mode, ptr, slice);
+                    self.write(ptr, slice);
                 },
 
 
@@ -971,7 +996,7 @@ impl Emulator {
 
                     if cond {
                         let pc = self.cache.pc();
-                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
+                        self.set_pc(pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -985,7 +1010,7 @@ impl Emulator {
 
                     if cond {
                         let pc = self.cache.pc();
-                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
+                        self.set_pc(pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -999,7 +1024,7 @@ impl Emulator {
 
                     if cond {
                         let pc = self.cache.pc();
-                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
+                        self.set_pc(pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -1013,7 +1038,7 @@ impl Emulator {
 
                     if cond {
                         let pc = self.cache.pc();
-                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
+                        self.set_pc(pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -1027,7 +1052,7 @@ impl Emulator {
 
                     if cond {
                         let pc = self.cache.pc();
-                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
+                        self.set_pc(pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -1041,7 +1066,7 @@ impl Emulator {
 
                     if cond {
                         let pc = self.cache.pc();
-                        self.cache.set_pc(&self.mem, pc.wrapping_add(imm as u64));
+                        self.set_pc(pc.wrapping_add(imm as u64));
                         continue;
                     }
                 },
@@ -1050,8 +1075,10 @@ impl Emulator {
                 Instr::JAlr { rd, rs1, imm } => {
                     let pc = self.cache.pc();
                     let t = pc + 4;
-                    self.cache.set_pc(&self.mem, self.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1));
-                    self.x.write(rd as usize, t);
+                    let status = self.set_pc(self.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1));
+                    if status {
+                        self.x.write(rd as usize, t);
+                    }
                     continue;
                 },
 
@@ -1067,7 +1094,7 @@ impl Emulator {
                 Instr::Readjust => {
                     core::hint::cold_path();
                     let pc = self.cache.pc();
-                    self.cache.set_pc(&self.mem, pc);
+                    self.set_pc(pc);
                     continue;
                 },
             }
@@ -1083,13 +1110,33 @@ impl Emulator {
     }
 
 
+
+    pub fn set_pc(&mut self, pc: u64) -> bool {
+        println!("hey new pc is at 0x{pc:x}");
+        if pc & 0b11 != 0 {
+            println!("trapped?");
+            self.trap(EXC_INSTR_ADDR_MISALIGNED, pc);
+            false
+        } else {
+            self.cache.set_pc(&self.mem, pc);
+            true
+        }
+    }
+
+
     pub fn run(&mut self, timeout_ms: u64, code: &[u8]) -> bool {
         return self.new_run(timeout_ms, code);
     }
 
 
+    pub fn write(&mut self, ptr: Ptr, data: &[u8]) {
+        self.mem.write(self.mode, ptr, data);
+        self.cache.invalidate(&self.mem, ptr)
+    }
+
+
     fn _ret(&mut self, status: usize, epc: usize, ie_bit: u32, pie_bit: u32, pp_bit: u32, pp_len: u32) {
-        let mut mstatus = self.csr_read(status);
+        let mut mstatus = self.csr.read(status);
         let mpie = ubfx_64(mstatus, pie_bit, 1);
         let mpp  = ubfx_64(mstatus, pp_bit, pp_len);
 
@@ -1108,16 +1155,34 @@ impl Emulator {
         // Set MPP = User (0)
         mstatus = bfi_64(mstatus, pp_bit, pp_len, 0);
 
-        self.csr_write(status, mstatus);
-        let epc = self.csr_read(epc);
-        self.cache.set_pc(&self.mem, epc);
+        self.csr.write(status, mstatus);
+        let epc = self.csr.read(epc);
+        println!("epc: 0x{epc:x}");
+        self.set_pc(epc);
+    }
+}
+
+
+impl Csr {
+    pub fn new() -> Self {
+        let mut csr = Self {
+            csr: [const { AtomicU64::new(0) }; _],
+        };
+
+        
+        // mstatus.UXL = 2 (64-bit user-mode XLEN)
+        let mstatus_init = 2u64 << 32;
+        csr.csr[CSR_MSTATUS].store(mstatus_init, Ordering::Release);
+
+        csr
+
     }
 
 
-    pub fn csr_read(&mut self, csr: usize) -> u64 {
+    pub fn read(&self, csr: usize) -> u64 {
         match csr {
             CSR_SSTATUS => {
-                let mstatus = self.csr[CSR_MSTATUS];
+                let mstatus = self.csr[CSR_MSTATUS].load(std::sync::atomic::Ordering::Acquire);
 
                 // Map bits: SSTATUS is view of MSTATUS
                 let sie  = (mstatus >> 1) & 1;
@@ -1133,16 +1198,39 @@ impl Emulator {
                 | (uxl << 32)
             }
 
-            _ => self.csr[csr],
+            CSR_SIP => {
+                let mip     = self.csr[CSR_MIP].load(Ordering::Acquire);
+                let mideleg = self.csr[CSR_MIDELEG].load(Ordering::Acquire);
+
+                // Only delegated bits from MIP are visible in SIP
+                mip & mideleg
+            }
+
+            
+            CSR_TSELECT => {
+                // "we have no triggers"
+                1
+            }
+
+
+            CSR_MISA => {
+                2 << 62
+                | 1 << 8
+                | 1 << 12
+                | 1 << 18
+                | 1 << 20
+            }
+
+            _ => self.csr[csr].load(std::sync::atomic::Ordering::Acquire),
         }
     }
 
 
-    pub fn csr_write(&mut self, csr: usize, value: u64) {
+    pub fn write(&self, csr: usize, value: u64) {
         match csr {
             CSR_SSTATUS => {
                 // Updates to SSTATUS must write into MSTATUS
-                let mut mstatus = self.csr[CSR_MSTATUS];
+                let mut mstatus = self.csr[CSR_MSTATUS].load(std::sync::atomic::Ordering::Acquire);
 
                 // Mask writable fields (SIE=1, SPIE=5, SPP=8)
                 let sie  = (value >> 1) & 1;
@@ -1153,28 +1241,69 @@ impl Emulator {
                 mstatus = (mstatus & !(1 << 5)) | (spie << 5);
                 mstatus = (mstatus & !(1 << 8)) | (spp << 8);
 
-                self.csr[CSR_MSTATUS] = mstatus;
+                self.csr[CSR_MSTATUS].store(mstatus, std::sync::atomic::Ordering::Release);
             }
 
             CSR_MSTATUS => {
-                // Mask off WLRL bits
-                let mask = 0
-                    | (1 << 3)  // MIE
-                    | (1 << 7)  // MPIE
-                    | (3 << 11) // MPP (2 bits)
-                    | (3 << 32); // UXL
-                self.csr[CSR_MSTATUS] = value & mask;
+                // Bits software is allowed to affect
+                let writable = (1 << 3)      // MIE
+                             | (1 << 7)      // MPIE
+                             | (3 << 11);    // MPP
+
+                let mut new = self.csr[CSR_MSTATUS].load(Ordering::Acquire);
+
+                // Update only writable bits from 'value'
+                new = (new & !writable) | (value & writable);
+
+                // Hard-wire UXL = 2 (64-bit)
+                new = (new & !(3 << 32)) | (2u64 << 32);
+
+                self.csr[CSR_MSTATUS].store(new, Ordering::Release);
+
             }
 
             CSR_MTVEC => {
                 // Low 2 bits must be 0 (direct) or 1 (vectored)
                 let mode = value & 0b11;
                 let base = value & !0b11;
-                self.csr[CSR_MTVEC] = base | mode.min(1);
+                self.csr[CSR_MTVEC].store(base | mode.min(1), std::sync::atomic::Ordering::Release);
+            }
+
+            CSR_SIP => {
+                let mut mip     = self.csr[CSR_MIP].load(Ordering::Acquire);
+                let mideleg = self.csr[CSR_MIDELEG].load(Ordering::Acquire);
+
+                // Only SSIP (bit 1) is writable via SIP
+                let mask = 1 << 1;
+
+                // Only writable if delegated to S-mode
+                let writable = mask & mideleg;
+
+                mip = (mip & !writable) | (value & writable);
+
+                self.csr[CSR_MIP].store(mip, Ordering::Release);
+            }
+
+            CSR_MIP => {
+                // Machine-mode write: only software interrupt bits writable
+                let mask = (1 << 1) | (1 << 5) | (1 << 9);
+
+                self.csr[CSR_MIP].store(
+                    (self.csr[CSR_MIP].load(Ordering::Acquire) & !mask) |
+                    (value & mask),
+                    Ordering::Release
+                );
+            }
+
+            CSR_TSELECT | CSR_TDATA1 | CSR_TDATA2 | CSR_TCONTROL => {
+                // Ignore writes; triggers unsupported
+            }
+
+            CSR_MISA => {
             }
 
             // Most CSRs just store the raw value
-            _ => self.csr[csr] = value,
+            _ => self.csr[csr].store(value, std::sync::atomic::Ordering::Release),
         }
     }
 }

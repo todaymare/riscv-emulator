@@ -1,4 +1,4 @@
-use std::{collections::HashMap, hint::unreachable_unchecked, ptr::null};
+use std::{alloc::{dealloc, Layout}, collections::HashMap, hint::unreachable_unchecked, ptr::null};
 
 use crate::{mem::{Memory, Ptr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}, Emulator};
 
@@ -108,7 +108,7 @@ const INSTR_INDEX_MASK : u64 = PAGE_INSTR_SIZE as u64 - 1;
 
 
 pub struct InstrCache {
-    pages: HashMap<u64, *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize]>,
+    pages: HashMap<u64, *mut [Instr; ACTUAL_PAGE_INSTR_SIZE as usize]>,
 
     page_pc: u64,
     page_ptr: *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize],
@@ -143,6 +143,22 @@ impl InstrCache {
     }
 
 
+    pub fn invalidate(&mut self, mem: &Memory, ptr: Ptr) {
+        let page = ptr.0 >> PAGE_BITS;
+        if let Some(val) = self.pages.remove(&page) {
+            println!("invalidated 0x{page:x}");
+            if self.page_ptr == val {
+                let page = self.load_page(page, mem);
+                let offset = unsafe { self.code_ptr.offset_from(self.page_ptr.as_ptr()) };
+                self.page_ptr = page;
+                unsafe { self.code_ptr = self.page_ptr.as_ptr().offset(offset) };
+            }
+
+            unsafe { drop(Box::from_raw(val)) };
+        }
+    }
+
+
     #[inline(always)]
     pub fn pc(&self) -> u64 {
         unsafe {
@@ -164,16 +180,12 @@ impl InstrCache {
     }
 
 
-    #[cold]
     fn load_page(&mut self, page: u64, mem: &Memory) -> *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize] {
-        println!("loading page 0x{page:x}");
         let entry = self.pages.entry(page);
 
         match entry {
             std::collections::hash_map::Entry::Occupied(occupied_entry) => *occupied_entry.get(),
             std::collections::hash_map::Entry::Vacant(vacant_entry) => {
-                println!("not loaded");
-
                 let base_ptr = page << PAGE_BITS;
                 let ptr = Box::leak(Box::new(core::array::from_fn(|i| {
                     if i+1 == ACTUAL_PAGE_INSTR_SIZE as usize {
@@ -562,6 +574,16 @@ impl Instr {
                 }
             }
             _ => todo!(),
+        }
+    }
+}
+
+
+
+impl Drop for InstrCache {
+    fn drop(&mut self) {
+        for page in &self.pages {
+            unsafe { drop(Box::from_raw(*page.1)) };
         }
     }
 }
