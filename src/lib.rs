@@ -167,24 +167,6 @@ impl Emulator {
             let cont = local.tick(shared);
             if !cont { return false }
 
-            // check interrupts
-            let pending = shared.csr.read(CSR_MIP);
-            let enabled = shared.csr.read(CSR_MIE);
-            let global_enabled = ubfx_64(shared.csr.read(CSR_MSTATUS), 3, 1);
-
-
-            if ((pending & enabled) != 0) && global_enabled == 1 {
-                for &code in INTERRUPTS.iter() {
-                    let mask = 1 << code;
-                    if (pending & mask != 0) && ((enabled & mask) != 0) {
-                        let cause = (1 << 63) | code; // Bit 63 = interrupt
-                        local.trap(shared, cause, 0);
-                        break;
-                    }
-                }
-            }
-
-
             // decode
             let instr = local.cache.get();
             //println!("pc: 0x{:x}, instr: {instr:?}", exec.cache.pc());
@@ -1207,7 +1189,28 @@ impl Local {
         let cycle = shared.csr.read(CSR_CYCLE) + 1;
         shared.csr.write(CSR_CYCLE, cycle);
 
-        if core::hint::likely(cycle % 1000 != 0) { return true }
+        if core::hint::likely(cycle % 128 != 0) { return true }
+
+        // check interrupts
+        let pending = shared.csr.read(CSR_MIP);
+        let enabled = shared.csr.read(CSR_MIE);
+        let global_enabled = ubfx_64(shared.csr.read(CSR_MSTATUS), 3, 1);
+
+
+        if ((pending & enabled) != 0) && global_enabled == 1 {
+            for &code in INTERRUPTS.iter() {
+                let mask = 1 << code;
+                if (pending & mask != 0) && ((enabled & mask) != 0) {
+                    let cause = (1 << 63) | code; // Bit 63 = interrupt
+                    self.trap(shared, cause, 0);
+                    break;
+                }
+            }
+        }
+
+
+
+        if core::hint::likely(cycle % 1024 != 0) { return true }
 
         #[cold]
         fn cold(local: &mut Local, shared: &Shared) -> bool {
@@ -1352,6 +1355,7 @@ impl Regs {
 
     #[inline(always)]
     pub fn write(&mut self, idx: usize, data: u64) {
+        cold_path();
         if idx == 0 { return }
         self.regs[idx] = data;
     }
