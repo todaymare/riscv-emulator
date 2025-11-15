@@ -144,6 +144,7 @@ impl InstrCache {
     }
 
 
+    #[cold]
     pub fn invalidate(&mut self) {
         self.page_pc = 0;
         self.page_ptr = null();
@@ -174,6 +175,7 @@ impl InstrCache {
     }
 
 
+    #[cold]
     fn load_page(&mut self, page: u64, mem: &Memory) -> *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize] {
         let entry = self.pages.entry(page);
 
@@ -536,41 +538,6 @@ impl Instr {
             }
 
             _ => Instr::Unknown,
-        }
-    }
-
-
-
-    fn handler(self) -> unsafe fn(&mut Emulator, Instr) {
-        match self {
-            Self::IAdd { .. } => {
-                |em, i| unsafe {
-                    let Self::IAdd { rd, rs1, imm } = i
-                    else { unreachable_unchecked() };
-
-                    em.x.write(
-                        rd as usize, 
-                        em.x.read(rs1 as usize).wrapping_add(imm as i64 as u64)
-                    );
-
-                    em.cache.next();
-                }
-            }
-
-            Self::IOr { .. } => {
-                |em, i| unsafe {
-                    let Self::IOr { rd, rs1, imm } = i
-                    else { unreachable_unchecked() };
-
-                    em.x.write(
-                        rd as usize, 
-                        em.x.read(rs1 as usize).wrapping_add(imm as i64 as u64)
-                    );
-
-                    em.cache.next();
-                }
-            }
-            _ => todo!(),
         }
     }
 }

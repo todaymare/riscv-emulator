@@ -2,7 +2,7 @@ use std::{any::Any, collections::HashMap, env, ffi::OsStr, option, panic, sync::
 
 use colourful::{Colour, ColourBrush};
 use pixels::{Pixels, SurfaceTexture};
-use riscv_emulator::{mem::{Memory, Ptr}, Csr, Emulator, CSR_MIP, INT_EXT_M, INT_EXT_S};
+use riscv_emulator::{mem::{Memory, Ptr}, Csr, Emulator, Shared, CSR_MIP, INT_EXT_M, INT_EXT_S};
 use winit::{application::ApplicationHandler, dpi::PhysicalSize, event::ElementState, event_loop::EventLoop, keyboard::Key, window::{Window, WindowAttributes}};
 
 
@@ -106,8 +106,9 @@ fn main() {
                     TestResult::Fail(em) => {
                         bucket.fail += 1;
 
-                        let exit_code = em.x.read(10);
-                        let testnum = em.x.read(3);
+                        let local = em.local.lock().unwrap();
+                        let exit_code = local.x.read(10);
+                        let testnum = local.x.read(3);
 
 
                         println!("{} (exit_code={exit_code}, TESTNUM={testnum})", "FAIL".red().bold())
@@ -200,8 +201,9 @@ fn main() {
             println!("{}", "PASS".green().bold())
         },
         TestResult::Fail(em) => {
-            let exit_code = em.x.read(10);
-            let testnum = em.x.read(3);
+            let local = em.local.lock().unwrap();
+            let exit_code = local.x.read(10);
+            let testnum = local.x.read(3);
 
 
             println!("{} (exit_code={exit_code}, TESTNUM={testnum})", "FAIL".red().bold())
@@ -233,21 +235,20 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
     let mut now = Instant::now();
     let file = std::fs::read(path).unwrap();
 
-    let em = Emulator::new();
-    let mem = em.mem.clone();
-    let csr = em.csr.clone();
-
-    let em = Arc::new(Mutex::new(em));
+    let em = Emulator::new(opts.timeout);
+    let em = Arc::new(em);
+    let shared = &em.shared;
 
     let em_thread = em.clone();
     let timeout = opts.timeout;
     let result = std::thread::spawn(move || 
         panic::catch_unwind(move || {
             let time = Instant::now();
-            let result = em_thread.lock().unwrap().run(timeout, &file);
+            let em_thread = em_thread.clone();
+            let result = em_thread.run(&file);
             let time = time.elapsed();
-            let cycles = em_thread.lock().unwrap().csr.read(0xC00);
-            //println!("{cycles} cycles in {time:?}");
+            let cycles = em_thread.shared.csr.read(0xC00);
+            println!("{cycles} cycles in {time:?} {:.2}MIPS", (cycles as f64 / time.as_secs_f64()) / 1_000_000.0);
             result
         })
     );
@@ -259,8 +260,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
         let mut app = App {
             data: None,
             cpu: &result,
-            mem: &mem,
-            csr: &csr,
+            shared,
         };
 
 
@@ -284,17 +284,14 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
 
 
 
-    let Ok(em) = Arc::into_inner(em).unwrap().into_inner()
-    else {
-        unreachable!();
-    };
+    let em = Arc::into_inner(em).unwrap();
 
     let result = result.unwrap();
     if !result {
         return TestResult::Timeout;
     }
 
-    let exit_code = em.x.read(10);
+    let exit_code = em.local.lock().unwrap().x.read(10);
 
     if exit_code == 0 {
         return TestResult::Pass(em)
@@ -307,8 +304,7 @@ fn test_file(opts: &Options, path: &str) -> TestResult {
 struct App<'a> {
     data: Option<AppInner>,
     cpu: &'a JoinHandle<Result<bool, Box<dyn Any + Send + 'static>>>,
-    mem: &'a Memory,
-    csr: &'a Csr,
+    shared: &'a Shared,
 }
 
 
@@ -361,7 +357,7 @@ impl ApplicationHandler for App<'_> {
 
 
                 loop {
-                    let is_frame_ready = self.mem.read_u8(settings);
+                    let is_frame_ready = self.shared.mem.read_u8(settings);
                     if is_frame_ready == 1 {
                         break;
                     }
@@ -380,8 +376,8 @@ impl ApplicationHandler for App<'_> {
                 let ptr = Ptr(0x4000_0000);
                 println!("0x{:x}", ptr.0 + buf.len() as u64);
 
-                buf.copy_from_slice(self.mem.read(ptr, buf.len()));
-                self.mem.write(riscv_emulator::Priv::Machine, settings, &[0]);
+                buf.copy_from_slice(self.shared.mem.read(ptr, buf.len()));
+                self.shared.mem.write(riscv_emulator::Priv::Machine, settings, &[0]);
 
                 data.pixels.render().unwrap();
 
@@ -402,16 +398,16 @@ impl ApplicationHandler for App<'_> {
                         // Take the first char (winit gives a String)
                         if let Some(ch) = text.chars().next() {
                             let ascii = ch as u32;
-                            self.mem.mmio_kbd_key.store(ascii, Ordering::Release);
-                            self.mem.mmio_kbd_status.store(1, Ordering::Release);
+                            self.shared.mem.mmio_kbd_key.store(ascii, Ordering::Release);
+                            self.shared.mem.mmio_kbd_status.store(1, Ordering::Release);
 
-                            let irq = self.mem.mmio_kbd_irq.load(Ordering::Relaxed);
+                            let irq = self.shared.mem.mmio_kbd_irq.load(Ordering::Relaxed);
                             // If interrupts are enabled:
                             if irq != 0 {
-                                let mut mip = self.csr.read(CSR_MIP);
+                                let mut mip = self.shared.csr.read(CSR_MIP);
                                 mip |= 1 << INT_EXT_M;
                                 println!("0b{:b}", mip);
-                                self.csr.write(CSR_MIP, mip);
+                                self.shared.csr.write(CSR_MIP, mip);
                             } else {
                                 println!("irq was 0b{irq:b}");
                             }
