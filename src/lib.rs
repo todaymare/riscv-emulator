@@ -6,7 +6,7 @@ pub mod mem;
 pub mod utils;
 pub mod instrs;
 
-use std::{hint::cold_path, mem::discriminant, ops::Rem, process::exit, ptr::null, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, thread::sleep_ms, time::Instant};
+use std::{hint::cold_path, mem::discriminant, ops::{Deref, Range, Rem}, process::exit, ptr::null, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
 
@@ -33,6 +33,9 @@ pub struct Local {
     start: Instant,
     last_ns: u64,
 
+    pub to_host: Option<u64>,
+    pub sig: Option<(Range<u64>, Box<[u8]>)>,
+    pub initial_pc: u64,
 }
 
 
@@ -80,6 +83,7 @@ pub const CSR_STVAL: usize = 0x143;
 pub const CSR_STVEC: usize = 0x105;
 pub const CSR_SSTATUS: usize = 0x100;
 pub const CSR_SIP : usize = 0x144;
+pub const CSR_SATP : usize = 0x180;
 
 
 pub const CSR_TSELECT : usize = 0x7A0;
@@ -144,13 +148,16 @@ impl Emulator {
                 cache: InstrCache::new(),
                 start: Instant::now(),
                 last_ns: 0,
+                to_host: None,
+                initial_pc: 0,
+                sig: None,
             }),
         }
     }
 
 
 
-    pub fn run(&self, code: &[u8]) -> bool {
+    pub fn run(&self) -> bool {
 
         let shared = &self.shared;
         let mut local = self.local.lock().unwrap();
@@ -158,19 +165,17 @@ impl Emulator {
         let mut cycle = 0;
         local.start = Instant::now();
         local.last_ns = 0;
-        local.x.write(2, 0xB000_0000);
 
         shared.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
-        shared.mem.write(local.mode, Ptr(0x8000_0000), code);
 
-        let mut code = local.cache.set_pc(&shared.mem, 0x8000_0000);
+        let mut code = local.cache.set_pc(&shared.mem, local.initial_pc);
 
-        loop {
+        let result = 'result: loop {
             cycle += 1;
             if core::hint::unlikely(cycle % 128 == 0) {
                 shared.csr.write(CSR_CYCLE, cycle);
                 let (new_code, cont) = local.tick(cycle, shared, code);
-                if !cont { return false }
+                if !cont { break 'result false }
 
                 if let Some(new_code) = new_code {
                     code = new_code;
@@ -182,7 +187,7 @@ impl Emulator {
 
             // decode
             let instr = code.get();
-            //println!("pc: 0x{:x}, instr: {instr:?}", exec.cache.pc());
+            //println!("pc: 0x{:x}, instr: {instr:?}", local.cache.pc(code));
 
             // execute
             match instr {
@@ -644,10 +649,23 @@ impl Emulator {
 
                 Instr::CsrRw { rd, rs1, csr } => {
                     core::hint::cold_path();
-                    let csr = csr as usize;
-                    let t = shared.csr.read(csr);
+                    let csr = csr as u64;
+                    let t = match local.read_csr(shared, code, cycle, csr) {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
 
-                    shared.csr.write(csr, local.x.read(rs1 as usize));
+
+                    let value = local.x.read(rs1 as usize);
+                    if let Err(e) = local.write_csr(shared, code, csr, value) {
+                        code = e;
+                        continue;
+                    }
+
+
 
                     local.x.write(rd as usize, t);
                 },
@@ -655,11 +673,23 @@ impl Emulator {
 
                 Instr::CsrRs { rd, rs1, csr } => {
                     core::hint::cold_path();
-                    let csr = csr as usize;
-                    let t = shared.csr.read(csr);
+                    let csr = csr as u64;
+                    let t = match local.read_csr(shared, code, cycle, csr) {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+
 
                     if rs1 != 0 {
-                        shared.csr.write(csr, t | local.x.read(rs1 as usize));
+                        let value = t | local.x.read(rs1 as usize);
+                        if let Err(e) = local.write_csr(shared, code, csr, value) {
+                            code = e;
+                            continue;
+                        }
                     }
 
                     local.x.write(rd as usize, t);
@@ -668,24 +698,48 @@ impl Emulator {
 
                 Instr::CsrRc { rd, rs1, csr } => {
                     core::hint::cold_path();
-                    let csr = csr as usize;
-                    let t = shared.csr.read(csr);
+                    let csr = csr as u64;
+                    let t = match local.read_csr(shared, code, cycle, csr) {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
 
                     if rs1 != 0 {
-                        shared.csr.write(csr, t & !local.x.read(rs1 as usize));
+                        let value = t & !local.x.read(rs1 as usize);
+                        if let Err(e) = local.write_csr(shared, code, csr, value) {
+                            code = e;
+                            continue;
+                        }
                     }
+
+
 
                     local.x.write(rd as usize, t);
                 },
 
 
                 Instr::CsrRwi { rd, rs1, csr } => {
-                    core::hint::cold_path();
-                    let csr = csr as usize;
-                    let t = shared.csr.read(csr);
+                    let csr = csr as u64;
+                    let t = match local.read_csr(shared, code, cycle, csr) {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+
 
                     if rs1 != 0 {
-                        shared.csr.write(csr, (rs1 & 0x1f) as _);
+                        let value = (rs1 & 0x1f) as _;
+                        if let Err(e) = local.write_csr(shared, code, csr, value) {
+                            code = e;
+                            continue;
+                        }
                     }
 
                     local.x.write(rd as usize, t);
@@ -693,12 +747,22 @@ impl Emulator {
 
 
                 Instr::CsrRsi { rd, rs1, csr } => {
-                    core::hint::cold_path();
-                    let csr = csr as usize;
-                    let t = shared.csr.read(csr);
+                    let csr = csr as u64;
+                    let t = match local.read_csr(shared, code, cycle, csr) {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
 
                     if rs1 != 0 {
-                        shared.csr.write(csr, t | rs1 as u64);
+                        let value = t | rs1 as u64;
+                        if let Err(e) = local.write_csr(shared, code, csr, value) {
+                            code = e;
+                            continue;
+                        }
                     }
 
                     local.x.write(rd as usize, t);
@@ -706,12 +770,25 @@ impl Emulator {
 
 
                 Instr::CsrRci { rd, rs1, csr } => {
-                    core::hint::cold_path();
-                    let csr = csr as usize;
-                    let t = shared.csr.read(csr);
+                    let csr = csr as u64;
+                    let t = match local.read_csr(shared, code, cycle, csr) {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+
+
 
                     if rs1 != 0 {
-                        shared.csr.write(csr, t & !(rs1 as u64));
+                        let value = t & !(rs1 as u64);
+
+                        if let Err(e) = local.write_csr(shared, code, csr, value) {
+                            code = e;
+                            continue;
+                        }
                     }
 
                     local.x.write(rd as usize, t);
@@ -728,9 +805,28 @@ impl Emulator {
                     };
 
 
-                    let num = local.x.read(17);
-                    if num == 93 {
-                        break;
+                    /*
+                    if let Some(sig) = &local.sig && cause == EXC_ECALL_MMODE {
+                        let mem_sig = shared.mem.read(Ptr(sig.0.start), (sig.0.end - sig.0.start) as usize);
+
+                        if mem_sig == &*sig.1 {
+                            local.x.write(10, 0);
+                        } else {
+                            local.x.write(10, 1);
+                        }
+
+                        break true;
+                    }
+                    */
+
+
+
+                    #[cfg(not(feature = "test-harness"))]
+                    {
+                        let num = local.x.read(17);
+                        if num == 93 {
+                            break true;
+                        }
                     }
 
                     code = local.trap(shared, code, cause, 0);
@@ -770,7 +866,7 @@ impl Emulator {
                             if core::hint::unlikely(cycle % 128 == 0) {
                                 shared.csr.write(CSR_CYCLE, cycle);
                                 let (new_code, cont) = local.tick(cycle, shared, code);
-                                if !cont { return false }
+                                if !cont { break 'result false; }
 
                                 if let Some(new_code) = new_code {
                                     code = new_code;
@@ -874,8 +970,29 @@ impl Emulator {
                 Instr::SW { rs1, rs2, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
+                    let rs2 = local.x.read(rs2 as usize) & 0xFFFF_FFFF;
+                    let slice = &(rs2 as u32).to_ne_bytes();
 
-                    let slice = &((local.x.read(rs2 as usize) & 0xFFFF_FFFF) as u32).to_ne_bytes();
+                    #[cfg(feature = "test-harness")]
+                    if let Some(tohost) = local.to_host && core::hint::unlikely(ptr.0 == tohost) && (rs2 & 0b1) == 1 {
+                        cold_path();
+
+                        if let Some(sig) = &local.sig {
+                            let mem_sig = shared.mem.read(Ptr(sig.0.start), (sig.0.end - sig.0.start) as usize);
+
+                            if mem_sig == &*sig.1 {
+                                local.x.write(10, 0);
+                            } else {
+                                local.x.write(10, 1);
+                            }
+                        } else {
+                            local.x.write(10, rs2 >> 1);
+                        }
+
+
+                        break 'result true;
+                    }
+
 
                     shared.mem.write(local.mode, ptr, slice);
                 },
@@ -996,6 +1113,10 @@ impl Emulator {
                     code = local.cache.set_pc(&shared.mem, pc);
                 }
 
+
+                Instr::Fence => {}
+
+
                 Instr::Unknown => {
                     code = local.trap(shared, code, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(local.cache.pc(code))) as u64);
                     continue;
@@ -1012,10 +1133,13 @@ impl Emulator {
 
             // finish
             code.next();
-        }
+        };
 
 
-        return true;
+        shared.csr.write(CSR_CYCLE, cycle);
+
+
+        result
 
     }
 }
@@ -1032,28 +1156,30 @@ impl Csr {
         csr.csr[CSR_MSTATUS].store(mstatus_init, Ordering::Release);
 
         csr
-
     }
 
 
-    #[inline(always)]
-    pub fn read(&self, csr: usize) -> u64 {
+    pub fn read_interp(&self, csr: usize, cycle: u64) -> u64 {
         match csr {
             CSR_SSTATUS => {
-                let mstatus = self.csr[CSR_MSTATUS].load(std::sync::atomic::Ordering::Relaxed);
+                let m = self.csr[CSR_MSTATUS].load(Ordering::Relaxed);
 
-                // Map bits: SSTATUS is view of MSTATUS
-                let sie  = (mstatus >> 1) & 1;
-                let spie = (mstatus >> 5) & 1;
-                let spp  = (mstatus >> 8) & 1;
+                let mut sstatus = 0;
 
-                // Only keep SIE, SPIE, SPP, UXL
-                let uxl = (mstatus >> 32) & 0b11;
+                // SIE/SPIE/SPP come from mstatus
+                sstatus |= (m >> 1) & 1 << 1;   // SIE
+                sstatus |= (m >> 5) & 1 << 5;   // SPIE
+                sstatus |= (m >> 8) & 1 << 8;   // SPP
 
-                (sie << 1)
-                | (spie << 5)
-                | (spp << 8)
-                | (uxl << 32)
+                // FS = 0, XS = 0
+                // SUM, MXR = 0
+
+                // UXL field (should equal MSTATUS.UXL)
+                sstatus |= (m & (3 << 32));
+
+                // SD = 0 because FS=XS=0
+
+                sstatus
             }
 
             CSR_SIP => {
@@ -1072,49 +1198,71 @@ impl Csr {
 
 
             CSR_MISA => {
-                2 << 62
-                | 1 << 8
-                | 1 << 12
-                | 1 << 18
-                | 1 << 20
+                (2u64 << 62)   |    // RV64 (MXL = 2)
+                (1 << 8)       |    // I extension
+                (1 << 12)           // M extension
             }
+
+
+            CSR_CYCLE => cycle,
 
             _ => self.csr[csr].load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
 
+    #[inline(always)]
+    pub fn read(&self, csr: usize) -> u64 {
+        match csr {
+            CSR_CYCLE => self.csr[csr].load(Ordering::Relaxed),
+            _ => self.read_interp(csr, 0),
+        }
+
+    }
+
+
     pub fn write(&self, csr: usize, value: u64) {
         match csr {
             CSR_SSTATUS => {
-                // Updates to SSTATUS must write into MSTATUS
-                let mut mstatus = self.csr[CSR_MSTATUS].load(std::sync::atomic::Ordering::Relaxed);
 
-                // Mask writable fields (SIE=1, SPIE=5, SPP=8)
+                let mut m = self.csr[CSR_MSTATUS].load(Ordering::Relaxed);
+
                 let sie  = (value >> 1) & 1;
                 let spie = (value >> 5) & 1;
                 let spp  = (value >> 8) & 1;
 
-                mstatus = (mstatus & !(1 << 1)) | (sie << 1);
-                mstatus = (mstatus & !(1 << 5)) | (spie << 5);
-                mstatus = (mstatus & !(1 << 8)) | (spp << 8);
+                // write into mstatus
+                m = (m & !(1 << 1)) | (sie << 1);
+                m = (m & !(1 << 5)) | (spie << 5);
+                m = (m & !(1 << 8)) | (spp << 8);
 
-                self.csr[CSR_MSTATUS].store(mstatus, std::sync::atomic::Ordering::Relaxed);
+                self.csr[CSR_MSTATUS].store(m, Ordering::Relaxed);
             }
 
             CSR_MSTATUS => {
-                // Bits software is allowed to affect
-                let writable = (1 << 3)      // MIE
-                             | (1 << 7)      // MPIE
-                             | (3 << 11);    // MPP
+                let old = self.csr[CSR_MSTATUS].load(Ordering::Relaxed);
+                let mut new = old;
 
-                let mut new = self.csr[CSR_MSTATUS].load(Ordering::Relaxed);
+                // Writable bits: MIE, MPIE, MPP (WARL)
+                // MPP legal values: 0, 1, 3
+                let mie  = (value >> 3) & 1;
+                let mpie = (value >> 7) & 1;
+                let mut mpp  = (value >> 11) & 0b11;
 
-                // Update only writable bits from 'value'
-                new = (new & !writable) | (value & writable);
+                // enforce WARL for MPP
+                if mpp == 2 { mpp = 0; }
 
-                // Hard-wire UXL = 2 (64-bit)
+                new = (new & !(1 << 3))  | (mie << 3);
+                new = (new & !(1 << 7))  | (mpie << 7);
+                new = (new & !(3 << 11)) | (mpp << 11);
+
+                // Hardwire UXL = 2 (RV64)
                 new = (new & !(3 << 32)) | (2u64 << 32);
+
+                // Hardwire SXL = 2 for S-mode
+                new = (new & !(3 << 34)) | (2u64 << 34);
+
+                // FS, XS, SUM, MXR, SD remain zero
 
                 self.csr[CSR_MSTATUS].store(new, Ordering::Relaxed);
 
@@ -1160,6 +1308,10 @@ impl Csr {
             CSR_MISA => {
             }
 
+
+            CSR_SATP => {
+            }
+
             // Most CSRs just store the raw value
             _ => self.csr[csr].store(value, std::sync::atomic::Ordering::Relaxed),
         }
@@ -1168,6 +1320,31 @@ impl Csr {
 
 
 impl Local {
+    pub fn read_csr(&mut self, shared: &Shared, code_ptr: CodePtr, cycle: u64, csr: u64) -> Result<u64, CodePtr> {
+        let perm = ubfx_64(csr, 8, 2);
+
+        if perm > self.mode as u64 {
+            return Err(self.trap(shared, code_ptr, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(self.cache.pc(code_ptr))) as _))
+        }
+
+        Ok(shared.csr.read_interp(csr as usize, cycle))
+    }
+
+
+    pub fn write_csr(&mut self, shared: &Shared, code_ptr: CodePtr, csr: u64, value: u64) -> Result<(), CodePtr> {
+        let perm = ubfx_64(csr, 8, 2);
+        let csr_type = ubfx_64(csr, 10, 2);
+
+        if perm > self.mode as u64 || csr_type == 0b01 {
+            return Err(self.trap(shared, code_ptr, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(self.cache.pc(code_ptr))) as _))
+        }
+
+
+
+        Ok(shared.csr.write(csr as usize, value))
+    }
+
+
     #[inline(always)]
     #[must_use]
     pub fn set_pc(&mut self, shared: &Shared, code_ptr: CodePtr, pc: u64) -> (CodePtr, bool) {

@@ -7,6 +7,10 @@ edition = "2024"
 colourful = { git = "https://github.com/todaymare/colourful" }
 winit = "*"
 pixels = "*"
+elf = "*"
+
+[features]
+test-harness = [] 
 
 [profile.release]
 debug = true

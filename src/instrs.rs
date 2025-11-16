@@ -92,6 +92,7 @@ pub enum Instr  {
     JAlr    { rd: u8, rs1: u8, imm: i16     },
 
     FenceI,
+    Fence,
     Nop,
     Unknown,
 
@@ -116,7 +117,7 @@ pub struct InstrCache {
 }
 
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[must_use]
 pub struct CodePtr(*const Instr);
 
@@ -405,7 +406,7 @@ impl Instr {
                 let funct3 = ubfx_32(instr, 12, 3);
                 match funct3 {
                     0b001 => Instr::FenceI,
-                    _ => Instr::Nop
+                    _ => Instr::Fence,
                 }
             }
 
