@@ -2,8 +2,31 @@ use std::{alloc::{dealloc, Layout}, collections::HashMap, hint::unreachable_unch
 
 use crate::{mem::{Memory, Ptr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}, Emulator};
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+//
+// okay so here's the thing. the u64 tag does make the instr enum 16 bytes yes
+// but it also means that on 64bit systems the cpu can just load the tag and
+// use it as an offset to the jump table
+//
+// this results in 550 MIPS
+//
+// if we were to make it a u8, the instr enum would be 8 bytes.
+// but the cpu would need to zero extend it before it can use it as a jump
+// table address
+//
+// which results in 535~ MIPS
+//
+// the reduced memory footprint of the instruction doesn't matter as much as
+// that bit of extra cpu work considering the instruction page already fits
+// into L1 cache and that extra cpu work is run more than 500 million times 
+// per second. 
+//
+// every picosecond counts
+//
+// but that's just a theory.. a performance theory
+// thanks for watching
+//
 #[repr(u64)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Instr  {
     IAdd    { rd: u8, rs1: u8, imm: i16     },
     ISlt    { rd: u8, rs1: u8, imm: i16     },
