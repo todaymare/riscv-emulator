@@ -9,6 +9,7 @@ pub mod instrs;
 use std::{hint::cold_path, mem::discriminant, ops::{Deref, Range, Rem}, process::exit, ptr::null, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, thread::sleep_ms, time::Instant};
 
 use colourful::ColourBrush;
+use elf::abi::SHT_STRTAB;
 
 use crate::{instrs::{CodePtr, Instr, InstrCache}, mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
@@ -48,7 +49,7 @@ unsafe impl Send for Emulator {}
 unsafe impl Sync for Emulator {}
 
 
-#[derive(Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Priv {
     User = 0,
     Supervisor = 1,
@@ -158,7 +159,6 @@ impl Emulator {
 
 
     pub fn run(&self) -> bool {
-
         let shared = &self.shared;
         let mut local = self.local.lock().unwrap();
         let local = &mut *local;
@@ -166,7 +166,7 @@ impl Emulator {
         local.start = Instant::now();
         local.last_ns = 0;
 
-        shared.mem.write(Priv::Machine, Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
+        shared.mem.write(Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
 
         let mut code = local.cache.set_pc(&shared.mem, local.initial_pc);
 
@@ -882,7 +882,16 @@ impl Emulator {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
-                    let result = shared.mem.read_u8(ptr) as i8 as i64 as u64;
+                    let result = local.read_u8(shared, code, AccessType::Load, ptr);
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+                    let result = result as i8 as i64 as u64;
 
                     local.x.write(rd as usize, result);
                 },
@@ -892,9 +901,16 @@ impl Emulator {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
-                    let result = shared.mem.read_u8(ptr) as u64;
+                    let result = local.read_u8(shared, code, AccessType::Load, ptr);
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
 
-                    local.x.write(rd as usize, result);
+                    local.x.write(rd as usize, result as u64);
                 },
 
 
@@ -902,7 +918,17 @@ impl Emulator {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
-                    let result = shared.mem.read_u16(ptr) as i16 as i64 as u64;
+                    let result = local.read_u16(shared, code, AccessType::Load, ptr);
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+
+                    let result = result as i16 as i64 as u64;
 
                     local.x.write(rd as usize, result);
                 },
@@ -912,7 +938,16 @@ impl Emulator {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
-                    let result = shared.mem.read_u16(ptr) as u64;
+                    let result = local.read_u16(shared, code, AccessType::Load, ptr);
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+                    let result = result as u64;
 
                     local.x.write(rd as usize, result);
                 },
@@ -922,7 +957,17 @@ impl Emulator {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
-                    let result = shared.mem.read_u32(ptr) as i32 as i64 as u64;
+                    let result = local.read_u32(shared, code, AccessType::Load, ptr);
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+
+                    let result = result as i32 as i64 as u64;
 
                     local.x.write(rd as usize, result);
                 },
@@ -932,7 +977,16 @@ impl Emulator {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
-                    let result = shared.mem.read_u32(ptr) as u64;
+                    let result = local.read_u32(shared, code, AccessType::Load, ptr);
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
+
+                    let result = result as u64;
 
                     local.x.write(rd as usize, result);
                 },
@@ -942,7 +996,14 @@ impl Emulator {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = Ptr(ptr);
 
-                    let result = shared.mem.read_u64(ptr);
+                    let result = local.read_u64(shared, code, AccessType::Load, ptr);
+                    let result = match result {
+                        Ok(v) => v,
+                        Err(v) => {
+                            code = v;
+                            continue;
+                        },
+                    };
 
                     local.x.write(rd as usize, result);
                 },
@@ -953,7 +1014,10 @@ impl Emulator {
 
                     let slice = &[(local.x.read(rs2 as usize) & 0xFF) as u8];
 
-                    shared.mem.write(local.mode, ptr, slice);
+                    if let Err(e) = local.write(shared, code, ptr, slice) {
+                        code = e;
+                        continue;
+                    }
                 },
 
 
@@ -963,7 +1027,10 @@ impl Emulator {
 
                     let slice = &((local.x.read(rs2 as usize) & 0xFFFF) as u16).to_ne_bytes();
 
-                    shared.mem.write(local.mode, ptr, slice);
+                    if let Err(e) = local.write(shared, code, ptr, slice) {
+                        code = e;
+                        continue;
+                    }
                 },
 
 
@@ -973,12 +1040,17 @@ impl Emulator {
                     let rs2 = local.x.read(rs2 as usize) & 0xFFFF_FFFF;
                     let slice = &(rs2 as u32).to_ne_bytes();
 
-                    #[cfg(feature = "test-harness")]
-                    if let Some(tohost) = local.to_host && core::hint::unlikely(ptr.0 == tohost) && (rs2 & 0b1) == 1 {
+                    //#[cfg(feature = "test-harness")]
+                    if let Ok(ptr) = local.mmu_translate(shared, code, AccessType::Load, ptr)
+                        && let Some(tohost) = local.to_host
+                        && core::hint::unlikely(ptr.0 == tohost)
+                        && (rs2 & 0b1) == 1 {
+
                         cold_path();
 
                         if let Some(sig) = &local.sig {
-                            let mem_sig = shared.mem.read(Ptr(sig.0.start), (sig.0.end - sig.0.start) as usize);
+                            let sig = local.sig.as_ref().unwrap();
+                            let mem_sig = shared.mem.read(ptr, (sig.0.end - sig.0.start) as usize);
 
                             if mem_sig == &*sig.1 {
                                 local.x.write(10, 0);
@@ -994,7 +1066,11 @@ impl Emulator {
                     }
 
 
-                    shared.mem.write(local.mode, ptr, slice);
+                    if let Err(e) = local.write(shared, code, ptr, slice) {
+                        code = e;
+                        continue;
+                    }
+
                 },
 
 
@@ -1004,7 +1080,11 @@ impl Emulator {
 
                     let slice = &local.x.read(rs2 as usize).to_ne_bytes();
 
-                    shared.mem.write(local.mode, ptr, slice);
+                    if let Err(e) = local.write(shared, code, ptr, slice) {
+                        code = e;
+                        continue;
+                    }
+
                 },
 
 
@@ -1428,7 +1508,8 @@ impl Local {
             mtime = mtime.wrapping_add(div as u64);
 
             local.last_ns = now - rem;
-            shared.mem.write(local.mode, Ptr(MTIME as _), &mtime.to_ne_bytes());
+            shared.mem.write(Ptr(MTIME as _), &mtime.to_ne_bytes());
+
 
             let bit = mtime >= shared.mem.read_u64(Ptr(MTIMECMP as _));
             let bit = bit as u64;
@@ -1527,8 +1608,148 @@ impl Local {
     }
 
 
+    pub fn read_u8(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u8, CodePtr> {
+        let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
+        Ok(shared.mem.read(ptr, 1)[0])
+    }
 
 
+    pub fn read_u16(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u16, CodePtr> {
+        let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
+        Ok(shared.mem.read_u16(ptr))
+    }
+
+
+    pub fn read_u32(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u32, CodePtr> {
+        let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
+        Ok(shared.mem.read_u32(ptr))
+    }
+
+
+    pub fn read_u64(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u64, CodePtr> {
+        let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
+        Ok(shared.mem.read_u64(ptr))
+    }
+
+
+    pub fn write(&mut self, shared: &Shared, code_ptr: CodePtr, ptr: Ptr, slice: &[u8]) -> Result<(), CodePtr> {
+        let ptr = self.mmu_translate(shared, code_ptr, AccessType::Store, ptr)?;
+        shared.mem.write(ptr, slice);
+        Ok(())
+    }
+
+
+    pub fn mmu_translate(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<Ptr, CodePtr> {
+        let satp = shared.csr.read(CSR_SATP);
+        let mode = ubfx_64(satp, 60, 4);
+
+        if mode == 0 {
+            return Ok(ptr);
+        }
+
+        let vpn2 = ubfx_64(ptr.0, 30, 9);
+        let vpn1 = ubfx_64(ptr.0, 21, 9);
+        let vpn0 = ubfx_64(ptr.0, 12, 9);
+
+        let vpn = [vpn0, vpn1, vpn2];
+        let mut ppn = satp & ((1 << 44) - 1);
+
+        let mut exit_level = 0;
+        for level in (0..=2).rev() {
+            let pte_addr = (ppn << 12) + vpn[level] * 8;
+            let mut pte = shared.mem.read_u64(Ptr(pte_addr));
+
+            let v = (pte & 1) != 0;
+            let r = ((pte >> 1) & 1) != 0;
+            let w = ((pte >> 2) & 1) != 0;
+            let x = ((pte >> 3) & 1) != 0;
+
+            if !v || (!r && w) {
+                return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0))
+            }
+
+            ppn = pte >> 10;
+
+
+            if r || x {
+                let a = ((pte >> 6) & 1) != 0;
+                let d = ((pte >> 7) & 1) != 0;
+
+                if !a {
+                    pte |= 1 << 6;
+                    shared.mem.write(Ptr(pte_addr), &pte.to_ne_bytes());
+                }
+
+                if matches!(ty, AccessType::Store) && !d {
+                    pte |= 1 << 7;
+                    shared.mem.write(Ptr(pte_addr), &pte.to_ne_bytes());
+                }
+
+                let u = ((pte >> 4) & 1) != 0;
+                let sstatus = shared.csr.read(CSR_SSTATUS);
+                let mxr = ubfx_64(sstatus, 19, 1) != 0;
+                let sum = ubfx_64(sstatus, 18, 1) != 0;
+                let cur_priv = self.mode;
+
+
+                if cur_priv == Priv::User && !u {
+                    return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0));
+                } 
+
+                if cur_priv == Priv::Supervisor && u && !sum {
+                    return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0));
+                }
+
+
+                if ty == AccessType::Load && !(r || (mxr && x)) {
+                    return Err(self.trap(shared, code_ptr, EXC_LOAD_PAGE_FAULT, ptr.0));
+                }
+
+
+                if ty == AccessType::Store && !w {
+                    return Err(self.trap(shared, code_ptr, EXC_STORE_PAGE_FAULT, ptr.0));
+                }
+
+
+                if ty == AccessType::Fetch && !x {
+                    return Err(self.trap(shared, code_ptr, EXC_INSTR_PAGE_FAULT, ptr.0));
+                }
+
+
+                exit_level = level;
+                break;
+            }
+        }
+
+        let offset_masks = [0xFFF, 0x1FFFFF, 0x3FFFFFFF];
+        let offset = ptr.0 & offset_masks[exit_level];
+
+        let pa = (ppn << 12) | offset;
+        Ok(Ptr(pa))
+    }
+
+
+
+
+}
+
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessType {
+    Fetch,
+    Load,
+    Store,
+}
+
+
+impl AccessType {
+    pub fn fault(self) -> u64 {
+        match self {
+            AccessType::Fetch => EXC_INSTR_PAGE_FAULT,
+            AccessType::Load => EXC_LOAD_PAGE_FAULT,
+            AccessType::Store => EXC_STORE_PAGE_FAULT,
+        }
+    }
 }
 
 

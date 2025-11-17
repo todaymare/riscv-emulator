@@ -96,10 +96,11 @@ fn main() {
 
                 let bucket = buckets.get_mut(bucket).unwrap();
 
+                println!("{}: ", name);
                 let emulator = get_elf_emulator(&options, name);
+                println!("eee?");
                 let result = test_emulator(&options, emulator);
 
-                print!("{}: ", name);
                 match result {
                     TestResult::Pass(_) => {
                         bucket.pass += 1;
@@ -246,7 +247,7 @@ fn get_bin_emulator(opts: &Options, path: &str) -> Emulator {
     {
         let mut local = em.local.lock().unwrap();
 
-        em.shared.mem.write(riscv_emulator::Priv::Machine, Ptr(0x8000_0000), &file);
+        em.shared.mem.write(Ptr(0x8000_0000), &file);
 
         // set the sp & pc
         local.x.write(2, 0xB000_4000);
@@ -307,6 +308,7 @@ fn get_elf_emulator(opts: &Options, path: &str) -> Emulator {
         // set the pc
         local.initial_pc = elf.ehdr.e_entry;
 
+        let mut biggest_size = None;
         if let Some(phdrs) = elf.segments() {
             for ph in phdrs {
                 if ph.p_type != elf::abi::PT_LOAD { continue }
@@ -319,20 +321,26 @@ fn get_elf_emulator(opts: &Options, path: &str) -> Emulator {
 
                 
                 let segment_data = &file[file_offset .. file_offset + file_size];
-                //println!("LOAD: 0x{:x}..0x{:x} SIGNATURE: {begin_sig:x?}", mem_addr, mem_addr as usize + mem_size);
+                println!("LOAD: 0x{:x}..0x{:x} SIGNATURE: {begin_sig:x?}", mem_addr, mem_addr as usize + mem_size);
 
-                em.shared.mem.write(riscv_emulator::Priv::Machine, Ptr(mem_addr), segment_data);
+                if let Some(biggest_size) = &mut biggest_size && *biggest_size < mem_addr as usize + mem_size {
+                    *biggest_size = mem_addr as usize + mem_size;
+                } else {
+                    biggest_size = Some(mem_addr as usize + mem_size);
+                }
+
+                em.shared.mem.write(Ptr(mem_addr), segment_data);
             }
         }
 
         if let Some(sig) = begin_sig {
-            sig_data = Some(em.shared.mem.read(Ptr(sig), (end_sig.unwrap() - sig) as _).to_vec().into_boxed_slice());
+            sig_data = Some(em.shared.mem.read(Ptr(sig), (end_sig.unwrap_or(biggest_size.unwrap() as _) - sig) as _).to_vec().into_boxed_slice());
         }
 
         local.to_host = tohost;
 
         if let Some(begin) = begin_sig {
-            local.sig = Some((begin..end_sig.unwrap(), sig_data.unwrap()));
+            local.sig = Some((begin..end_sig.unwrap_or(biggest_size.unwrap() as _), sig_data.unwrap()));
         }
 
         let sp = 'b: {
@@ -494,7 +502,7 @@ impl ApplicationHandler for App<'_> {
                 println!("0x{:x}", ptr.0 + buf.len() as u64);
 
                 buf.copy_from_slice(self.shared.mem.read(ptr, buf.len()));
-                self.shared.mem.write(riscv_emulator::Priv::Machine, settings, &[0]);
+                self.shared.mem.write(settings, &[0]);
 
                 data.pixels.render().unwrap();
 

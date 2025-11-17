@@ -1,6 +1,6 @@
-use std::{alloc::{alloc, alloc_zeroed, dealloc, Layout}, ops::Range, sync::atomic::{AtomicU32, AtomicU8}};
+use std::{alloc::{alloc, alloc_zeroed, dealloc, Layout}, ops::Range, sync::atomic::{AtomicU32, AtomicU8}, thread::park_timeout};
 
-use crate::Priv;
+use crate::{utils::{ubfx_32, ubfx_64}, Priv};
 
 
 const REGIONS : [Region; 5] = [
@@ -92,50 +92,29 @@ impl Memory {
 
 
     pub fn read<'me>(&self, ptr: Ptr, size: usize) -> &[u8] {
-        for region in REGIONS {
-            if region.range.contains(&ptr.0) {
-                debug_assert!(ptr.0 <= region.range.end - size as u64);
-
-                unsafe {
-
-                let mut ptr = self.buff.0.add(ptr.0 as usize);
-                core::hint::black_box(&mut ptr);
-                let slice = core::slice::from_raw_parts(ptr, size);
-                return slice;
-
-                }
-
-
-            }
+        assert!(ptr.0.saturating_add(size as u64) < MEMORY_SIZE);
+        unsafe {
+            let mut ptr = self.buff.0.add(ptr.0 as usize);
+            core::hint::black_box(&mut ptr);
+            core::slice::from_raw_parts(ptr, size)
         }
 
-        core::hint::cold_path();
-        panic!("bus error {:x}", ptr.0);
     }
 
 
     pub fn read_sized<const N: usize>(&self, ptr: Ptr) -> [u8; N] {
-        for region in REGIONS {
-            if region.range.contains(&ptr.0) {
-                debug_assert!(ptr.0 <= region.range.end - N as u64);
-
-                unsafe {
-                let mut ptr = self.buff.0.add(ptr.0 as usize).cast();
-                core::hint::black_box(&mut ptr);
-                return *ptr;
-
-                }
-
-
-            }
+        assert!(ptr.0.saturating_add(N as u64) < MEMORY_SIZE);
+        unsafe {
+            let mut ptr = self.buff.0.add(ptr.0 as usize).cast();
+            core::hint::black_box(&mut ptr);
+            *ptr
         }
 
-        core::hint::cold_path();
-        panic!("bus error {:x}", ptr.0);
     }
 
 
-    pub fn write<'me>(&self, perm: Priv, ptr: Ptr, data: &[u8]) {
+    pub fn write<'me>(&self, ptr: Ptr, data: &[u8]) {
+        assert!(ptr.0.saturating_add(data.len() as u64) < MEMORY_SIZE);
 
         if data.len() == 4 {
             match ptr.0 {
@@ -151,26 +130,13 @@ impl Memory {
             }
         }
 
-        for region in REGIONS {
-            if region.range.contains(&ptr.0) {
-                if core::hint::unlikely((perm as u64) < (region.perm as u64)) {
-                    panic!("permission error");
-                }
 
-                unsafe {
-
-                let mut ptr = self.buff.0.add(ptr.0 as usize);
-                core::hint::black_box(&mut ptr);
-                core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-
-                }
-
-                return;
-            }
+        unsafe {
+            let mut ptr = self.buff.0.add(ptr.0 as usize);
+            core::hint::black_box(&mut ptr);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
 
-        core::hint::cold_path();
-        panic!("bus error 0x{:x}", ptr.0);
     }
 }
 
