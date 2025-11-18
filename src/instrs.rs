@@ -1,6 +1,6 @@
 use std::{alloc::{dealloc, Layout}, collections::HashMap, hint::unreachable_unchecked, ptr::null};
 
-use crate::{mem::{Memory, Ptr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}, Emulator};
+use crate::{mem::{Memory, PhysPtr, VirtPtr}, utils::{bfi_32, sbfx_32, sbfx_64, ubfx_32}, Emulator};
 
 #[repr(u16)]
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -93,6 +93,7 @@ pub enum Instr  {
 
     FenceI,
     Fence,
+    FenceVMA,
     Nop,
     Unknown,
 
@@ -110,10 +111,16 @@ const INSTR_INDEX_MASK : u64 = PAGE_INSTR_SIZE as u64 - 1;
 
 
 pub struct InstrCache {
-    pages: HashMap<u64, *mut [Instr; ACTUAL_PAGE_INSTR_SIZE as usize]>,
+    pages: HashMap<u64, *mut Page>,
 
-    page_pc: u64,
-    page_ptr: *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize],
+    page_vc: u64,
+    page_ptr: *const Page,
+}
+
+
+struct Page {
+    instrs: [Instr; ACTUAL_PAGE_INSTR_SIZE as usize],
+    mem   : [u32; PAGE_INSTR_SIZE as usize],
 }
 
 
@@ -126,65 +133,85 @@ impl InstrCache {
     pub fn new() -> InstrCache {
         Self {
             pages: HashMap::new(),
-            page_pc: 0,
+            page_vc: u64::MAX,
             page_ptr: null(),
         }
     }
 
 
-    pub fn set_pc(&mut self, mem: &Memory, pc: u64) -> CodePtr {
-        let page = pc >> PAGE_BITS;
-        let page_pc = pc & !PAGE_MASK;
+    pub fn set_pc(&mut self, mem: &Memory, vc: VirtPtr, pc: PhysPtr) -> CodePtr {
+        let vc = vc.0;
+        let pc = pc.0;
+        let vpage = vc >> PAGE_BITS;
+        let ppage = pc >> PAGE_BITS;
+        let vpage_pc = vc & !PAGE_MASK;
 
         let page_ptr =
-            if core::hint::likely(self.page_pc == page_pc) { self.page_ptr }
-            else { self.load_page(page, mem) };
+            if core::hint::likely(self.page_vc == vpage_pc) { self.page_ptr }
+            else { self.load_page(vpage, ppage, mem) };
 
-        self.page_pc = page_pc;
+        self.page_vc = vpage_pc;
         self.page_ptr = page_ptr;
 
-        let offset = (pc - self.page_pc) / size_of::<u32>() as u64;
-        CodePtr(unsafe { self.page_ptr.as_ptr().add(offset as usize) })
+        let offset = (vc - self.page_vc) / size_of::<u32>() as u64;
+        CodePtr(unsafe { (*self.page_ptr).instrs.as_ptr().add(offset as usize) })
     }
 
 
     #[cold]
     pub fn invalidate(&mut self) {
-        self.page_pc = 0;
-        self.page_ptr = null();
-
+        //self.page_vc = u64::MAX;
         self.pages.clear();
     }
 
 
     #[inline(always)]
-    pub fn pc(&self, codeptr: CodePtr) -> u64 {
+    pub fn pc(&self, codeptr: CodePtr) -> VirtPtr {
         unsafe {
-            let instr_index = codeptr.0.offset_from(self.page_ptr.as_ptr()) as u64;
-            self.page_pc + instr_index * size_of::<u32>() as u64
+            let instr_index = codeptr.0.offset_from((*self.page_ptr).instrs.as_ptr()) as u64;
+            VirtPtr(self.page_vc + instr_index * size_of::<u32>() as u64)
+        }
+    }
+
+
+    #[inline(always)]
+    pub fn code(&self, codeptr: CodePtr) -> u32 {
+        unsafe {
+            let instr_index = codeptr.0.offset_from((*self.page_ptr).instrs.as_ptr()) as u64;
+            *(*self.page_ptr).mem.as_ptr().add(instr_index as usize)
         }
     }
 
 
     #[cold]
-    fn load_page(&mut self, page: u64, mem: &Memory) -> *const [Instr; ACTUAL_PAGE_INSTR_SIZE as usize] {
-        let entry = self.pages.entry(page);
+    fn load_page(&mut self, vpage: u64, ppage: u64, mem: &Memory) -> *const Page {
+        println!("loading page 0x{vpage:x}");
+        let entry = self.pages.entry(vpage);
 
         match entry {
             std::collections::hash_map::Entry::Occupied(occupied_entry) => *occupied_entry.get(),
             std::collections::hash_map::Entry::Vacant(vacant_entry) => {
-                let base_ptr = page << PAGE_BITS;
-                let ptr = Box::leak(Box::new(core::array::from_fn(|i| {
+                let base_ptr = ppage << PAGE_BITS;
+                let mut mems = [0; PAGE_INSTR_SIZE as usize];
+                let instrs = core::array::from_fn(|i| {
                     if i+1 == ACTUAL_PAGE_INSTR_SIZE as usize {
                         return Instr::Readjust;
                     }
 
                     let ptr = base_ptr + i as u64 * 4;
-                    let ptr = Ptr(ptr);
+                    let ptr = PhysPtr(ptr);
                     let instr = mem.read_u32(ptr);
+                    mems[i] = instr;
 
                     Instr::decode(instr)
-                })));
+                });
+
+                let page = Page {
+                    instrs,
+                    mem: mems,
+                };
+
+                let ptr = Box::leak(Box::new(page));
 
                 *vacant_entry.insert(ptr)
             },
@@ -444,7 +471,7 @@ impl Instr {
                             0b00010_00_00101 => Instr::SWfi { },
 
                             // sfence.vma
-                            _ if ubfx_32(instr, 25, 7) == 0b0001001 => Instr::Nop, 
+                            _ if ubfx_32(instr, 25, 7) == 0b0001001 => Instr::FenceVMA, 
 
                             _ => Instr::Unknown,
                         }

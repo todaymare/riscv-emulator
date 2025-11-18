@@ -11,7 +11,7 @@ use std::{hint::cold_path, mem::discriminant, ops::{Deref, Range, Rem}, process:
 use colourful::ColourBrush;
 use elf::abi::SHT_STRTAB;
 
-use crate::{instrs::{CodePtr, Instr, InstrCache}, mem::{Memory, Ptr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
+use crate::{instrs::{CodePtr, Instr, InstrCache}, mem::{Memory, PhysPtr, VirtPtr}, utils::{bfi_32, bfi_64, sbfx_32, sbfx_64, ubfx_32, ubfx_64}};
 
 pub struct Emulator {
     pub local: Mutex<Local>,
@@ -166,9 +166,9 @@ impl Emulator {
         local.start = Instant::now();
         local.last_ns = 0;
 
-        shared.mem.write(Ptr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
+        shared.mem.write(PhysPtr(MTIMECMP as _), &u64::MAX.to_ne_bytes());
 
-        let mut code = local.cache.set_pc(&shared.mem, local.initial_pc);
+        let mut code = local.cache.set_pc(&shared.mem, VirtPtr(local.initial_pc), PhysPtr(local.initial_pc));
 
         let result = 'result: loop {
             cycle += 1;
@@ -187,7 +187,7 @@ impl Emulator {
 
             // decode
             let instr = code.get();
-            //println!("pc: 0x{:x}, instr: {instr:?}", local.cache.pc(code));
+            //println!("pc: 0x{:x?}, instr: {instr:?}", local.cache.pc(code));
 
             // execute
             match instr {
@@ -626,9 +626,9 @@ impl Emulator {
 
                 Instr::Jal { rd, offset } => {
                     let pc = local.cache.pc(code);
-                    let (new_cptr, success) = local.set_pc(shared, code, pc.wrapping_add(offset as i32 as i64 as u64));
+                    let (new_cptr, success) = local.set_pc(shared, code, VirtPtr(pc.0.wrapping_add(offset as i32 as i64 as u64)));
                     if success {
-                        local.x.write(rd as usize, pc.wrapping_add(4));
+                        local.x.write(rd as usize, pc.0.wrapping_add(4));
                     }
 
                     code = new_cptr;
@@ -638,7 +638,7 @@ impl Emulator {
 
 
                 Instr::Auipc { rd, offset } => {
-                    local.x.write(rd as usize, local.cache.pc(code).wrapping_add(offset as i64 as u64));
+                    local.x.write(rd as usize, local.cache.pc(code).0.wrapping_add(offset as i64 as u64));
                 },
 
 
@@ -797,28 +797,11 @@ impl Emulator {
 
                 Instr::SECall { } => {
                     core::hint::cold_path();
-                    //println!("ecall");
                     let cause = match local.mode {
                         Priv::User        => EXC_ECALL_UMODE,
                         Priv::Supervisor  => EXC_ECALL_SMODE,
                         Priv::Machine     => EXC_ECALL_MMODE,
                     };
-
-
-                    /*
-                    if let Some(sig) = &local.sig && cause == EXC_ECALL_MMODE {
-                        let mem_sig = shared.mem.read(Ptr(sig.0.start), (sig.0.end - sig.0.start) as usize);
-
-                        if mem_sig == &*sig.1 {
-                            local.x.write(10, 0);
-                        } else {
-                            local.x.write(10, 1);
-                        }
-
-                        break true;
-                    }
-                    */
-
 
 
                     #[cfg(not(feature = "test-harness"))]
@@ -836,7 +819,7 @@ impl Emulator {
 
                 Instr::SEBreak { } => {
                     core::hint::cold_path();
-                    code = local.trap(shared, code, EXC_BREAKPOINT, local.cache.pc(code));
+                    code = local.trap(shared, code, EXC_BREAKPOINT, local.cache.pc(code).0);
                     continue;
                 },
 
@@ -860,6 +843,7 @@ impl Emulator {
                     let mstatus = shared.csr.read(CSR_MSTATUS);
                     let mie = (mstatus >> 3) & 1; // MIE bit in mstatus
 
+                    //println!("wfi");
                     if mie != 0 {
                         while (shared.csr.read(CSR_MIE) & shared.csr.read(CSR_MIP)) == 0 {
                             cycle += 1;
@@ -875,12 +859,14 @@ impl Emulator {
                             }
                         }
                     }
+
+                    //println!("wfi ovr");
                 },
 
 
                 Instr::LB { rd, rs1, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let result = local.read_u8(shared, code, AccessType::Load, ptr);
                     let result = match result {
@@ -899,7 +885,7 @@ impl Emulator {
 
                 Instr::LBu { rd, rs1, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let result = local.read_u8(shared, code, AccessType::Load, ptr);
                     let result = match result {
@@ -916,7 +902,7 @@ impl Emulator {
 
                 Instr::LH { rd, rs1, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let result = local.read_u16(shared, code, AccessType::Load, ptr);
                     let result = match result {
@@ -936,7 +922,7 @@ impl Emulator {
 
                 Instr::LHu { rd, rs1, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let result = local.read_u16(shared, code, AccessType::Load, ptr);
                     let result = match result {
@@ -955,7 +941,7 @@ impl Emulator {
 
                 Instr::LW { rd, rs1, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let result = local.read_u32(shared, code, AccessType::Load, ptr);
                     let result = match result {
@@ -975,7 +961,7 @@ impl Emulator {
 
                 Instr::LWu { rd, rs1, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let result = local.read_u32(shared, code, AccessType::Load, ptr);
                     let result = match result {
@@ -994,7 +980,7 @@ impl Emulator {
 
                 Instr::LD { rd, rs1, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let result = local.read_u64(shared, code, AccessType::Load, ptr);
                     let result = match result {
@@ -1010,7 +996,7 @@ impl Emulator {
 
                 Instr::SB { rs1, rs2, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let slice = &[(local.x.read(rs2 as usize) & 0xFF) as u8];
 
@@ -1023,7 +1009,7 @@ impl Emulator {
 
                 Instr::SH { rs1, rs2, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let slice = &((local.x.read(rs2 as usize) & 0xFFFF) as u16).to_ne_bytes();
 
@@ -1036,19 +1022,21 @@ impl Emulator {
 
                 Instr::SW { rs1, rs2, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
                     let rs2 = local.x.read(rs2 as usize) & 0xFFFF_FFFF;
                     let slice = &(rs2 as u32).to_ne_bytes();
 
+                    let phys_ptr = local.mmu_translate(shared, code, AccessType::Store, ptr);
+
+                    //println!("host is 0x{:x?} writing to 0x{:x} 0x{:x?} rs2 is {rs2:b}", local.to_host, ptr.0, phys_ptr);
                     //#[cfg(feature = "test-harness")]
                     if let Ok(ptr) = local.mmu_translate(shared, code, AccessType::Load, ptr)
                         && let Some(tohost) = local.to_host
-                        && core::hint::unlikely(ptr.0 == tohost)
-                        && (rs2 & 0b1) == 1 {
+                        && core::hint::unlikely(ptr.0 == tohost) {
 
                         cold_path();
 
-                        if let Some(sig) = &local.sig {
+                        if local.sig.is_some() {
                             let sig = local.sig.as_ref().unwrap();
                             let mem_sig = shared.mem.read(ptr, (sig.0.end - sig.0.start) as usize);
 
@@ -1076,7 +1064,7 @@ impl Emulator {
 
                 Instr::SD { rs1, rs2, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
-                    let ptr = Ptr(ptr);
+                    let ptr = VirtPtr(ptr);
 
                     let slice = &local.x.read(rs2 as usize).to_ne_bytes();
 
@@ -1096,7 +1084,7 @@ impl Emulator {
 
                     if cond {
                         let pc = local.cache.pc(code);
-                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
+                        code = local.set_pc(shared, code, VirtPtr(pc.0.wrapping_add(imm as u64))).0;
                         continue;
                     }
                 },
@@ -1110,7 +1098,7 @@ impl Emulator {
 
                     if cond {
                         let pc = local.cache.pc(code);
-                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
+                        code = local.set_pc(shared, code, VirtPtr(pc.0.wrapping_add(imm as u64))).0;
                         continue;
                     }
                 },
@@ -1124,7 +1112,7 @@ impl Emulator {
 
                     if cond {
                         let pc = local.cache.pc(code);
-                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
+                        code = local.set_pc(shared, code, VirtPtr(pc.0.wrapping_add(imm as u64))).0;
                         continue;
                     }
                 },
@@ -1138,7 +1126,7 @@ impl Emulator {
 
                     if cond {
                         let pc = local.cache.pc(code);
-                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
+                        code = local.set_pc(shared, code, VirtPtr(pc.0.wrapping_add(imm as u64))).0;
                         continue;
                     }
                 },
@@ -1152,7 +1140,7 @@ impl Emulator {
 
                     if cond {
                         let pc = local.cache.pc(code);
-                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
+                        code = local.set_pc(shared, code, VirtPtr(pc.0.wrapping_add(imm as u64))).0;
                         continue;
                     }
                 },
@@ -1166,7 +1154,7 @@ impl Emulator {
 
                     if cond {
                         let pc = local.cache.pc(code);
-                        code = local.set_pc(shared, code, pc.wrapping_add(imm as u64)).0;
+                        code = local.set_pc(shared, code, VirtPtr(pc.0.wrapping_add(imm as u64))).0;
                         continue;
                     }
                 },
@@ -1174,8 +1162,8 @@ impl Emulator {
 
                 Instr::JAlr { rd, rs1, imm } => {
                     let pc = local.cache.pc(code);
-                    let t = pc + 4;
-                    let (new_cptr, status) = local.set_pc(shared, code, local.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1));
+                    let t = pc.0 + 4;
+                    let (new_cptr, status) = local.set_pc(shared, code, VirtPtr(local.x.read(rs1 as usize).wrapping_add(imm as u64) & (!1)));
                     if status {
                         local.x.write(rd as usize, t);
                     }
@@ -1190,15 +1178,24 @@ impl Emulator {
                 Instr::FenceI => {
                     let pc = local.cache.pc(code);
                     local.cache.invalidate();
-                    code = local.cache.set_pc(&shared.mem, pc);
+                    code = local.set_pc(shared, code, pc).0;
                 }
 
 
                 Instr::Fence => {}
 
 
+                Instr::FenceVMA => {
+
+                    let pc = local.cache.pc(code);
+                    //local.cache.invalidate();
+                    code = local.set_pc(shared, code, VirtPtr(pc.0 + 4)).0;
+
+                }
+
+
                 Instr::Unknown => {
-                    code = local.trap(shared, code, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(local.cache.pc(code))) as u64);
+                    code = local.trap(shared, code, EXC_ILLEGAL_INSTRUCTION, local.cache.code(code) as u64);
                     continue;
                 },
 
@@ -1348,6 +1345,39 @@ impl Csr {
 
             }
 
+            CSR_SATP => {
+                let old = self.csr[CSR_SATP].load(Ordering::Relaxed);
+
+                //
+                // Extract components from incoming value
+                //
+                let mode = (value >> 60) & 0xF;     // MODE field
+                let asid = (value >> 44) & 0xFFFF;  // ASID is 16 bits in RV64 (WARL)
+                let ppn  = value & ((1 << 44) - 1); // PPN is always 44 bits (WARL)
+
+                //
+                // MODE is WARL: legal values = 0 (Bare), 8 (Sv39), 9 (Sv48), 10(Sv57)
+                // Anything else is ignored.
+                //
+                let legal_mode = match mode {
+                    0 | 8 | 9 | 10 => mode,
+                    _ => (old >> 60) & 0xF,   // keep old
+                };
+
+                //
+                // Construct new SATP (legal parts only)
+                //
+                let new =
+                    (legal_mode << 60) |       // mode
+                    (asid        << 44) |       // truncated ASID
+                    (ppn & ((1 << 44) - 1));    // legal 44-bit PPN
+
+                //
+                // Commit new value
+                //
+                self.csr[CSR_SATP].store(new, Ordering::Relaxed);
+            }
+
             CSR_MTVEC => {
                 // Low 2 bits must be 0 (direct) or 1 (vectored)
                 let mode = value & 0b11;
@@ -1389,8 +1419,6 @@ impl Csr {
             }
 
 
-            CSR_SATP => {
-            }
 
             // Most CSRs just store the raw value
             _ => self.csr[csr].store(value, std::sync::atomic::Ordering::Relaxed),
@@ -1404,7 +1432,7 @@ impl Local {
         let perm = ubfx_64(csr, 8, 2);
 
         if perm > self.mode as u64 {
-            return Err(self.trap(shared, code_ptr, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(self.cache.pc(code_ptr))) as _))
+            return Err(self.trap(shared, code_ptr, EXC_ILLEGAL_INSTRUCTION, self.cache.code(code_ptr) as _))
         }
 
         Ok(shared.csr.read_interp(csr as usize, cycle))
@@ -1416,7 +1444,7 @@ impl Local {
         let csr_type = ubfx_64(csr, 10, 2);
 
         if perm > self.mode as u64 || csr_type == 0b01 {
-            return Err(self.trap(shared, code_ptr, EXC_ILLEGAL_INSTRUCTION, shared.mem.read_u32(Ptr(self.cache.pc(code_ptr))) as _))
+            return Err(self.trap(shared, code_ptr, EXC_ILLEGAL_INSTRUCTION, self.cache.code(code_ptr) as _))
         }
 
 
@@ -1427,12 +1455,20 @@ impl Local {
 
     #[inline(always)]
     #[must_use]
-    pub fn set_pc(&mut self, shared: &Shared, code_ptr: CodePtr, pc: u64) -> (CodePtr, bool) {
-        if pc & 0b11 != 0 {
-            (self.trap(shared, code_ptr, EXC_INSTR_ADDR_MISALIGNED, pc), false)
-        } else {
-            (self.cache.set_pc(&shared.mem, pc), true)
+    pub fn set_pc(&mut self, shared: &Shared, code_ptr: CodePtr, vpc: VirtPtr) -> (CodePtr, bool) {
+        if vpc.0 & 0b11 != 0 {
+            return (self.trap(shared, code_ptr, EXC_INSTR_ADDR_MISALIGNED, vpc.0), false)
         }
+
+        let pc = match self.mmu_translate(shared, code_ptr, AccessType::Fetch, vpc) {
+            Ok(v) => v,
+            Err(v) => {
+                return (v, false)
+            },
+        };
+
+
+        (self.cache.set_pc(&shared.mem, vpc, pc), true)
     }
 
 
@@ -1462,7 +1498,7 @@ impl Local {
 
         shared.csr.write(status_csr, mstatus);
         let epc = shared.csr.read(epc_csr);
-        self.set_pc(shared, code_ptr, epc).0
+        self.set_pc(shared, code_ptr, VirtPtr(epc)).0
     }
 
 
@@ -1488,11 +1524,11 @@ impl Local {
 
 
 
-        if core::hint::likely(cycle % 1024 != 0) { return (new_code, true) }
+        if core::hint::likely(cycle % 256 != 0) { return (new_code, true) }
 
         #[cold]
         fn cold(local: &mut Local, shared: &Shared) -> bool {
-            let mut mtime = shared.mem.read_u64(Ptr(MTIME as _));
+            let mut mtime = shared.mem.read_u64(PhysPtr(MTIME as _));
 
             const MTIME_TICK_NS: u64 = 100; // 10MHz
             let elapsed = local.start.elapsed();
@@ -1508,10 +1544,10 @@ impl Local {
             mtime = mtime.wrapping_add(div as u64);
 
             local.last_ns = now - rem;
-            shared.mem.write(Ptr(MTIME as _), &mtime.to_ne_bytes());
+            shared.mem.write(PhysPtr(MTIME as _), &mtime.to_ne_bytes());
 
 
-            let bit = mtime >= shared.mem.read_u64(Ptr(MTIMECMP as _));
+            let bit = mtime >= shared.mem.read_u64(PhysPtr(MTIMECMP as _));
             let bit = bit as u64;
             let mip = bfi_64(shared.csr.read(CSR_MIP), 7, 1, bit);
             shared.csr.write(CSR_MIP, mip);
@@ -1585,7 +1621,7 @@ impl Local {
         status = bfi_64(status, pp_bit, pp_len, self.mode as u64);
 
         shared.csr.write(status_csr, status);
-        shared.csr.write(epc_csr, self.cache.pc(code_ptr));
+        shared.csr.write(epc_csr, self.cache.pc(code_ptr).0);
         shared.csr.write(cause_csr, mcause);
         shared.csr.write(tval_csr, tval);
 
@@ -1604,47 +1640,47 @@ impl Local {
                 base
             };
 
-        self.set_pc(shared, code_ptr, pc).0
+        self.set_pc(shared, code_ptr, VirtPtr(pc)).0
     }
 
 
-    pub fn read_u8(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u8, CodePtr> {
+    pub fn read_u8(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: VirtPtr) -> Result<u8, CodePtr> {
         let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
         Ok(shared.mem.read(ptr, 1)[0])
     }
 
 
-    pub fn read_u16(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u16, CodePtr> {
+    pub fn read_u16(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: VirtPtr) -> Result<u16, CodePtr> {
         let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
         Ok(shared.mem.read_u16(ptr))
     }
 
 
-    pub fn read_u32(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u32, CodePtr> {
+    pub fn read_u32(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: VirtPtr) -> Result<u32, CodePtr> {
         let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
         Ok(shared.mem.read_u32(ptr))
     }
 
 
-    pub fn read_u64(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<u64, CodePtr> {
+    pub fn read_u64(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: VirtPtr) -> Result<u64, CodePtr> {
         let ptr = self.mmu_translate(shared, code_ptr, ty, ptr)?;
         Ok(shared.mem.read_u64(ptr))
     }
 
 
-    pub fn write(&mut self, shared: &Shared, code_ptr: CodePtr, ptr: Ptr, slice: &[u8]) -> Result<(), CodePtr> {
+    pub fn write(&mut self, shared: &Shared, code_ptr: CodePtr, ptr: VirtPtr, slice: &[u8]) -> Result<(), CodePtr> {
         let ptr = self.mmu_translate(shared, code_ptr, AccessType::Store, ptr)?;
         shared.mem.write(ptr, slice);
         Ok(())
     }
 
 
-    pub fn mmu_translate(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: Ptr) -> Result<Ptr, CodePtr> {
+    pub fn mmu_translate(&mut self, shared: &Shared, code_ptr: CodePtr, ty: AccessType, ptr: VirtPtr) -> Result<PhysPtr, CodePtr> {
         let satp = shared.csr.read(CSR_SATP);
         let mode = ubfx_64(satp, 60, 4);
 
         if mode == 0 {
-            return Ok(ptr);
+            return Ok(PhysPtr(ptr.0));
         }
 
         let vpn2 = ubfx_64(ptr.0, 30, 9);
@@ -1652,12 +1688,12 @@ impl Local {
         let vpn0 = ubfx_64(ptr.0, 12, 9);
 
         let vpn = [vpn0, vpn1, vpn2];
-        let mut ppn = satp & ((1 << 44) - 1);
+        let mut ppn = ubfx_64(satp, 0, 44);
 
         let mut exit_level = 0;
         for level in (0..=2).rev() {
             let pte_addr = (ppn << 12) + vpn[level] * 8;
-            let mut pte = shared.mem.read_u64(Ptr(pte_addr));
+            let mut pte = shared.mem.read_u64(PhysPtr(pte_addr));
 
             let v = (pte & 1) != 0;
             let r = ((pte >> 1) & 1) != 0;
@@ -1668,7 +1704,7 @@ impl Local {
                 return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0))
             }
 
-            ppn = pte >> 10;
+            ppn = (pte >> 10) & ((1 << 44) - 1);
 
 
             if r || x {
@@ -1677,12 +1713,12 @@ impl Local {
 
                 if !a {
                     pte |= 1 << 6;
-                    shared.mem.write(Ptr(pte_addr), &pte.to_ne_bytes());
+                    shared.mem.write(PhysPtr(pte_addr), &pte.to_ne_bytes());
                 }
 
                 if matches!(ty, AccessType::Store) && !d {
                     pte |= 1 << 7;
-                    shared.mem.write(Ptr(pte_addr), &pte.to_ne_bytes());
+                    shared.mem.write(PhysPtr(pte_addr), &pte.to_ne_bytes());
                 }
 
                 let u = ((pte >> 4) & 1) != 0;
@@ -1725,7 +1761,7 @@ impl Local {
         let offset = ptr.0 & offset_masks[exit_level];
 
         let pa = (ppn << 12) | offset;
-        Ok(Ptr(pa))
+        Ok(PhysPtr(pa))
     }
 
 
@@ -1778,5 +1814,4 @@ impl Regs {
         unsafe { *self.regs.get_unchecked_mut(idx) = data; }
     }
 }
-
 

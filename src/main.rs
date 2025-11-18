@@ -3,7 +3,7 @@ use std::{any::Any, collections::HashMap, env, panic, sync::{atomic::Ordering, A
 use colourful::{Colour, ColourBrush};
 use elf::{endian::AnyEndian, ElfBytes};
 use pixels::{Pixels, SurfaceTexture};
-use riscv_emulator::{mem::{Memory, Ptr}, Csr, Emulator, Shared, CSR_MIP, INT_EXT_M, INT_EXT_S};
+use riscv_emulator::{mem::{Memory, PhysPtr}, Csr, Emulator, Shared, CSR_MIP, INT_EXT_M, INT_EXT_S};
 use winit::{application::ApplicationHandler, dpi::PhysicalSize, event::ElementState, event_loop::EventLoop, keyboard::Key, window::{Window, WindowAttributes}};
 
 
@@ -247,7 +247,7 @@ fn get_bin_emulator(opts: &Options, path: &str) -> Emulator {
     {
         let mut local = em.local.lock().unwrap();
 
-        em.shared.mem.write(Ptr(0x8000_0000), &file);
+        em.shared.mem.write(PhysPtr(0x8000_0000), &file);
 
         // set the sp & pc
         local.x.write(2, 0xB000_4000);
@@ -329,12 +329,12 @@ fn get_elf_emulator(opts: &Options, path: &str) -> Emulator {
                     biggest_size = Some(mem_addr as usize + mem_size);
                 }
 
-                em.shared.mem.write(Ptr(mem_addr), segment_data);
+                em.shared.mem.write(PhysPtr(mem_addr), segment_data);
             }
         }
 
         if let Some(sig) = begin_sig {
-            sig_data = Some(em.shared.mem.read(Ptr(sig), (end_sig.unwrap_or(biggest_size.unwrap() as _) - sig) as _).to_vec().into_boxed_slice());
+            sig_data = Some(em.shared.mem.read(PhysPtr(sig), (end_sig.unwrap_or(biggest_size.unwrap() as _) - sig) as _).to_vec().into_boxed_slice());
         }
 
         local.to_host = tohost;
@@ -478,7 +478,7 @@ impl ApplicationHandler for App<'_> {
             winit::event::WindowEvent::RedrawRequested => {
                 let data = self.data.as_mut().unwrap();
 
-                let settings = Ptr(0x4010_0000);
+                let settings = PhysPtr(0x4010_0000);
 
 
                 loop {
@@ -498,7 +498,7 @@ impl ApplicationHandler for App<'_> {
 
 
                 let buf = data.pixels.frame_mut();
-                let ptr = Ptr(0x4000_0000);
+                let ptr = PhysPtr(0x4000_0000);
                 println!("0x{:x}", ptr.0 + buf.len() as u64);
 
                 buf.copy_from_slice(self.shared.mem.read(ptr, buf.len()));

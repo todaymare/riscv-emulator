@@ -63,17 +63,17 @@ impl Memory {
     }
 
 
-    pub fn read_u8(&self, ptr: Ptr) -> u8 {
+    pub fn read_u8(&self, ptr: PhysPtr) -> u8 {
         self.read_sized::<1>(ptr)[0]
     }
 
 
-    pub fn read_u16(&self, ptr: Ptr) -> u16 {
+    pub fn read_u16(&self, ptr: PhysPtr) -> u16 {
         u16::from_ne_bytes(self.read_sized(ptr))
     }
 
 
-    pub fn read_u32(&self, ptr: Ptr) -> u32 {
+    pub fn read_u32(&self, ptr: PhysPtr) -> u32 {
         match ptr.0 {
             MMIO_KBD_STATUS => self.mmio_kbd_status.load(std::sync::atomic::Ordering::Acquire),
             MMIO_KBD_KEY    => self.mmio_kbd_key.swap(0, std::sync::atomic::Ordering::AcqRel),
@@ -85,13 +85,13 @@ impl Memory {
     }
 
 
-    pub fn read_u64(&self, ptr: Ptr) -> u64 {
+    pub fn read_u64(&self, ptr: PhysPtr) -> u64 {
         u64::from_ne_bytes(self.read_sized(ptr))
     }
 
 
 
-    pub fn read<'me>(&self, ptr: Ptr, size: usize) -> &[u8] {
+    pub fn read<'me>(&self, ptr: PhysPtr, size: usize) -> &[u8] {
         assert!(ptr.0.saturating_add(size as u64) < MEMORY_SIZE);
         unsafe {
             let mut ptr = self.buff.0.add(ptr.0 as usize);
@@ -102,8 +102,8 @@ impl Memory {
     }
 
 
-    pub fn read_sized<const N: usize>(&self, ptr: Ptr) -> [u8; N] {
-        assert!(ptr.0.saturating_add(N as u64) < MEMORY_SIZE);
+    pub fn read_sized<const N: usize>(&self, ptr: PhysPtr) -> [u8; N] {
+        assert!(ptr.0.saturating_add(N as u64) < MEMORY_SIZE, "0x{:x}", ptr.0);
         unsafe {
             let mut ptr = self.buff.0.add(ptr.0 as usize).cast();
             core::hint::black_box(&mut ptr);
@@ -113,7 +113,7 @@ impl Memory {
     }
 
 
-    pub fn write<'me>(&self, ptr: Ptr, data: &[u8]) {
+    pub fn write<'me>(&self, ptr: PhysPtr, data: &[u8]) {
         assert!(ptr.0.saturating_add(data.len() as u64) < MEMORY_SIZE);
 
         if data.len() == 4 {
@@ -158,5 +158,9 @@ impl Region {
 }
 
 
-#[derive(Clone, Copy)]
-pub struct Ptr(pub u64);
+#[derive(Debug, Clone, Copy)]
+pub struct VirtPtr(pub u64);
+
+
+#[derive(Debug, Clone, Copy)]
+pub struct PhysPtr(pub u64);
