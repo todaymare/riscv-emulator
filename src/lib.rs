@@ -1186,11 +1186,6 @@ impl Emulator {
 
 
                 Instr::FenceVMA => {
-
-                    let pc = local.cache.pc(code);
-                    //local.cache.invalidate();
-                    code = local.set_pc(shared, code, VirtPtr(pc.0 + 4)).0;
-
                 }
 
 
@@ -1448,8 +1443,17 @@ impl Local {
         }
 
 
+        shared.csr.write(csr as usize, value);
+        
+        if csr as usize == CSR_SATP {
+            println!("writing to satp value os 0b{value:b}");
+            let pc = self.cache.pc(code_ptr);
+            println!("the vpc is 0x{:x}", pc.0);
+            self.cache.invalidate();
+            return Err(self.set_pc(shared, code_ptr, pc).0)
+        }
 
-        Ok(shared.csr.write(csr as usize, value))
+        Ok(())
     }
 
 
@@ -1689,11 +1693,14 @@ impl Local {
 
         let vpn = [vpn0, vpn1, vpn2];
         let mut ppn = ubfx_64(satp, 0, 44);
+        println!("root addr is 0x{ppn:x}");
 
         let mut exit_level = 0;
         for level in (0..=2).rev() {
             let pte_addr = (ppn << 12) + vpn[level] * 8;
+            println!("addr is 0x{:x}", pte_addr);
             let mut pte = shared.mem.read_u64(PhysPtr(pte_addr));
+            println!("pte 0b{pte:b}");
 
             let v = (pte & 1) != 0;
             let r = ((pte >> 1) & 1) != 0;
@@ -1729,25 +1736,30 @@ impl Local {
 
 
                 if cur_priv == Priv::User && !u {
+                panic!();
                     return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0));
                 } 
 
                 if cur_priv == Priv::Supervisor && u && !sum {
+                panic!();
                     return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0));
                 }
 
 
                 if ty == AccessType::Load && !(r || (mxr && x)) {
+                panic!();
                     return Err(self.trap(shared, code_ptr, EXC_LOAD_PAGE_FAULT, ptr.0));
                 }
 
 
                 if ty == AccessType::Store && !w {
+                panic!();
                     return Err(self.trap(shared, code_ptr, EXC_STORE_PAGE_FAULT, ptr.0));
                 }
 
 
                 if ty == AccessType::Fetch && !x {
+                panic!();
                     return Err(self.trap(shared, code_ptr, EXC_INSTR_PAGE_FAULT, ptr.0));
                 }
 
