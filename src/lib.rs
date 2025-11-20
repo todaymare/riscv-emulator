@@ -35,6 +35,7 @@ pub struct Local {
     last_ns: u64,
 
     pub to_host: Option<u64>,
+    pub cpu_string: Option<u64>,
     pub sig: Option<(Range<u64>, Box<[u8]>)>,
     pub initial_pc: u64,
 }
@@ -150,6 +151,7 @@ impl Emulator {
                 start: Instant::now(),
                 last_ns: 0,
                 to_host: None,
+                cpu_string: None,
                 initial_pc: 0,
                 sig: None,
             }),
@@ -1026,10 +1028,8 @@ impl Emulator {
                     let rs2 = local.x.read(rs2 as usize) & 0xFFFF_FFFF;
                     let slice = &(rs2 as u32).to_ne_bytes();
 
-                    let phys_ptr = local.mmu_translate(shared, code, AccessType::Store, ptr);
-
                     //println!("host is 0x{:x?} writing to 0x{:x} 0x{:x?} rs2 is {rs2:b}", local.to_host, ptr.0, phys_ptr);
-                    //#[cfg(feature = "test-harness")]
+                    #[cfg(feature = "test-harness")]
                     if let Ok(ptr) = local.mmu_translate(shared, code, AccessType::Load, ptr)
                         && let Some(tohost) = local.to_host
                         && core::hint::unlikely(ptr.0 == tohost) {
@@ -1065,6 +1065,7 @@ impl Emulator {
                 Instr::SD { rs1, rs2, offset } => {
                     let ptr = (local.x.read(rs1 as usize) as i64 + offset as i64) as u64;
                     let ptr = VirtPtr(ptr);
+                    //println!("storing at 0x{:x}", ptr.0);
 
                     let slice = &local.x.read(rs2 as usize).to_ne_bytes();
 
@@ -1320,6 +1321,7 @@ impl Csr {
                 let mie  = (value >> 3) & 1;
                 let mpie = (value >> 7) & 1;
                 let mut mpp  = (value >> 11) & 0b11;
+                let mprv = (value >> 17) & 1;
 
                 // enforce WARL for MPP
                 if mpp == 2 { mpp = 0; }
@@ -1327,6 +1329,7 @@ impl Csr {
                 new = (new & !(1 << 3))  | (mie << 3);
                 new = (new & !(1 << 7))  | (mpie << 7);
                 new = (new & !(3 << 11)) | (mpp << 11);
+                new = (new & !(1 << 17)) | (mprv << 17);
 
                 // Hardwire UXL = 2 (RV64)
                 new = (new & !(3 << 32)) | (2u64 << 32);
@@ -1450,7 +1453,7 @@ impl Local {
             let pc = self.cache.pc(code_ptr);
             println!("the vpc is 0x{:x}", pc.0);
             self.cache.invalidate();
-            return Err(self.set_pc(shared, code_ptr, pc).0)
+            return Err(self.set_pc(shared, code_ptr, VirtPtr(pc.0 + 4)).0)
         }
 
         Ok(())
@@ -1464,12 +1467,33 @@ impl Local {
             return (self.trap(shared, code_ptr, EXC_INSTR_ADDR_MISALIGNED, vpc.0), false)
         }
 
+
         let pc = match self.mmu_translate(shared, code_ptr, AccessType::Fetch, vpc) {
             Ok(v) => v,
             Err(v) => {
                 return (v, false)
             },
         };
+
+
+        if Some(pc.0) == self.cpu_string {
+            let addr = self.x.read(10);
+            let mut addr = self.mmu_translate(shared, code_ptr, AccessType::Load, VirtPtr(addr)).unwrap();
+
+            let mut msg = vec![];
+
+            loop {
+                let byte = shared.mem.read_u8(addr);
+                if byte == 0 { break };
+
+                msg.push(byte);
+
+                addr.0 += 1;
+            }
+
+            panic!("cpustring: {}", str::from_utf8(&msg).unwrap());
+            return (code_ptr, true);
+        }
 
 
         (self.cache.set_pc(&shared.mem, vpc, pc), true)
@@ -1687,20 +1711,39 @@ impl Local {
             return Ok(PhysPtr(ptr.0));
         }
 
+
+        if self.mode == Priv::Machine {
+            if matches!(ty, AccessType::Fetch) {
+                return Ok(PhysPtr(ptr.0));
+            }
+
+            let mstatus = shared.csr.read(CSR_MSTATUS);
+            let mprv = (mstatus >> 17) & 1 != 0;
+
+            if !mprv {
+                return Ok(PhysPtr(ptr.0));
+            }
+
+            let mpp = (mstatus >> 11) & 0b11;
+            if mpp == 0b11 {
+                return Ok(PhysPtr(ptr.0));
+            }
+        }
+
         let vpn2 = ubfx_64(ptr.0, 30, 9);
         let vpn1 = ubfx_64(ptr.0, 21, 9);
         let vpn0 = ubfx_64(ptr.0, 12, 9);
 
         let vpn = [vpn0, vpn1, vpn2];
         let mut ppn = ubfx_64(satp, 0, 44);
-        println!("root addr is 0x{ppn:x}");
+        //println!("root addr is 0x{ppn:x}");
 
         let mut exit_level = 0;
         for level in (0..=2).rev() {
             let pte_addr = (ppn << 12) + vpn[level] * 8;
-            println!("addr is 0x{:x}", pte_addr);
+            //println!("addr is 0x{:x}", pte_addr);
             let mut pte = shared.mem.read_u64(PhysPtr(pte_addr));
-            println!("pte 0b{pte:b}");
+            //println!("pte 0b{pte:b}");
 
             let v = (pte & 1) != 0;
             let r = ((pte >> 1) & 1) != 0;
@@ -1736,30 +1779,25 @@ impl Local {
 
 
                 if cur_priv == Priv::User && !u {
-                panic!();
                     return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0));
                 } 
 
                 if cur_priv == Priv::Supervisor && u && !sum {
-                panic!();
                     return Err(self.trap(shared, code_ptr, ty.fault(), ptr.0));
                 }
 
 
                 if ty == AccessType::Load && !(r || (mxr && x)) {
-                panic!();
                     return Err(self.trap(shared, code_ptr, EXC_LOAD_PAGE_FAULT, ptr.0));
                 }
 
 
                 if ty == AccessType::Store && !w {
-                panic!();
                     return Err(self.trap(shared, code_ptr, EXC_STORE_PAGE_FAULT, ptr.0));
                 }
 
 
                 if ty == AccessType::Fetch && !x {
-                panic!();
                     return Err(self.trap(shared, code_ptr, EXC_INSTR_PAGE_FAULT, ptr.0));
                 }
 

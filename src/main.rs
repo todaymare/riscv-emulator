@@ -96,11 +96,10 @@ fn main() {
 
                 let bucket = buckets.get_mut(bucket).unwrap();
 
-                println!("{}: ", name);
                 let emulator = get_elf_emulator(&options, name);
-                println!("eee?");
                 let result = test_emulator(&options, emulator);
 
+                println!("{}: ", name);
                 match result {
                     TestResult::Pass(_) => {
                         bucket.pass += 1;
@@ -299,7 +298,13 @@ fn get_elf_emulator(opts: &Options, path: &str) -> Emulator {
                     "end_signature" => {
                         end_sig = Some(sym.st_value);
                     }
-                    _ => {}
+                    "cputstring" => {
+                        local.cpu_string = Some(sym.st_value);
+                    }
+                    _ => {
+                        //println!("{name}");
+
+                    }
                 }
             }
         }
