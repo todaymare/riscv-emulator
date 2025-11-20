@@ -109,7 +109,7 @@ pub const EXC_ECALL_MMODE:            u64 = 11;
 pub const EXC_INSTR_PAGE_FAULT:       u64 = 12;
 pub const EXC_LOAD_PAGE_FAULT:        u64 = 13;
 // 14 reserved
-pub const EXC_STORE_PAGE_FAULT:       u64 = 15;
+pub const EXC_STORE_PAGE_FAULT:       u64 = 0xf;
 
 
 pub const INT_SOFT_S: u64 = 1;
@@ -1476,6 +1476,7 @@ impl Local {
         };
 
 
+        #[cfg(feature="test-harness")]
         if Some(pc.0) == self.cpu_string {
             let addr = self.x.read(10);
             let mut addr = self.mmu_translate(shared, code_ptr, AccessType::Load, VirtPtr(addr)).unwrap();
@@ -1741,9 +1742,7 @@ impl Local {
         let mut exit_level = 0;
         for level in (0..=2).rev() {
             let pte_addr = (ppn << 12) + vpn[level] * 8;
-            //println!("addr is 0x{:x}", pte_addr);
             let mut pte = shared.mem.read_u64(PhysPtr(pte_addr));
-            //println!("pte 0b{pte:b}");
 
             let v = (pte & 1) != 0;
             let r = ((pte >> 1) & 1) != 0;
@@ -1756,20 +1755,10 @@ impl Local {
 
             ppn = (pte >> 10) & ((1 << 44) - 1);
 
-
             if r || x {
                 let a = ((pte >> 6) & 1) != 0;
                 let d = ((pte >> 7) & 1) != 0;
 
-                if !a {
-                    pte |= 1 << 6;
-                    shared.mem.write(PhysPtr(pte_addr), &pte.to_ne_bytes());
-                }
-
-                if matches!(ty, AccessType::Store) && !d {
-                    pte |= 1 << 7;
-                    shared.mem.write(PhysPtr(pte_addr), &pte.to_ne_bytes());
-                }
 
                 let u = ((pte >> 4) & 1) != 0;
                 let sstatus = shared.csr.read(CSR_SSTATUS);
@@ -1799,6 +1788,17 @@ impl Local {
 
                 if ty == AccessType::Fetch && !x {
                     return Err(self.trap(shared, code_ptr, EXC_INSTR_PAGE_FAULT, ptr.0));
+                }
+
+
+                if !a {
+                    pte |= 1 << 6;
+                    shared.mem.write(PhysPtr(pte_addr), &pte.to_ne_bytes());
+                }
+
+                if ty == AccessType::Store && !d {
+                    pte |= 1 << 7;
+                    shared.mem.write(PhysPtr(pte_addr), &pte.to_ne_bytes());
                 }
 
 
