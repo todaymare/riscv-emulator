@@ -186,7 +186,7 @@ fn main() {
         println!("------------------------------------");
         println!();
 
-        println!("tests run: {}, score: {}, passed: {}, fail: {}, crashed: {}, timeout: {}", format!("{pass}/{total}").yellow().bold(), (((pass as f64/total as f64) * 100.0).round()).yellow().bold(), pass.green().bold(), fail.red().bold(), crashed.red().bold(), timeout.red().bold());
+        println!("tests run: {}, score: {}, passed: {}, fail: {}, crashed: {}, timeout: {}", format!("{pass}/{total}").colour(if pass == total { Colour::rgb(0, 255, 0) } else { Colour::rgb(255, 255, 0) }).bold(), (((pass as f64/total as f64) * 100.0).round()).colour(if pass == total { Colour::rgb(0, 255, 0) } else { Colour::rgb(255, 255, 0) }).bold(), pass.green().bold(), fail.red().bold(), crashed.red().bold(), timeout.red().bold());
         println!();
 
         return;

@@ -1639,10 +1639,7 @@ impl Local {
 
     pub fn trap(&mut self, shared: &Shared, code_ptr: CodePtr, cause: u64, tval: u64) -> CodePtr {
         // Double-fault detection: if we trap while already in a trap handler, abort
-        self.trap_depth += 1;
-        if self.trap_depth > 2 {
-            panic!("double fault: trap while handling trap (cause={:#x}, tval={:#x})", cause, tval);
-        }
+        
         let medeleg = shared.csr.read(CSR_MEDELEG);
         let mideleg = shared.csr.read(CSR_MIDELEG);
 
@@ -1654,6 +1651,12 @@ impl Local {
                 let mut mip = shared.csr.read(CSR_MIP);
                 mip &= !(1 << code);
                 shared.csr.write(CSR_MIP, mip);
+            }
+        } else {
+            self.trap_depth += 1;
+
+            if self.trap_depth > 5 {
+                panic!("double fault: trap while handling trap (cause={:#x}, tval={:#x})", cause, tval);
             }
         }
 
