@@ -251,6 +251,9 @@ fn get_bin_emulator(opts: &Options, path: &str) -> Emulator {
         // set the sp & pc
         local.x.write(2, 0xB000_4000);
         local.initial_pc = 0x8000_0000;
+        
+        // Set default tohost address for riscv-tests .bin files
+        local.to_host = Some(0x80001000);
     }
 
     em
